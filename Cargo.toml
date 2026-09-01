@@ -1,0 +1,22 @@
+[package]
+name = "ps-reclaim"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Per-domain grace-period reclamation for lock-free readers"
+repository = "https://github.com/pathscale/ps-reclaim"
+
+[dependencies]
+
+[dev-dependencies]
+# Only to measure against what this replaces. Not a runtime dependency.
+crossbeam-epoch = "0.9.18"
+seize = "0.5.1"
+criterion = "0.5"
+
+[[bench]]
+name = "pin"
+harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ps_loom)'] }
