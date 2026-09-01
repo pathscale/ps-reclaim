@@ -204,3 +204,19 @@ fn dropping_the_domain_runs_the_remainder() {
         "dropping leaked retirements"
     );
 }
+
+/// A guard is one word.
+///
+/// Not a style preference: `partition_ref` in WorkTable returns a
+/// `PartRef { guard, &T }` and drops it on every lookup, so the guard's size
+/// is paid per call. At three words that cost more than this crate's cheaper
+/// pin saved, and the lookup measured slower than the `crossbeam-epoch` one
+/// it replaced despite winning every isolated pin benchmark.
+#[test]
+fn a_guard_is_one_word() {
+    assert_eq!(
+        std::mem::size_of::<ps_reclaim::Guard<'_>>(),
+        std::mem::size_of::<usize>(),
+        "a guard grew; anything returning one from a hot path pays for it per call"
+    );
+}

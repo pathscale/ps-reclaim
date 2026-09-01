@@ -1,6 +1,6 @@
 [package]
 name = "ps-reclaim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Per-domain grace-period reclamation for lock-free readers"

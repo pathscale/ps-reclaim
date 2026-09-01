@@ -1,5 +1,6 @@
 //! The grace-period domain and its guard.
 
+use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
@@ -93,11 +94,7 @@ impl Domain {
         // as idle while this thread goes on to load a pointer it is freeing.
         fence(Ordering::SeqCst);
 
-        Guard {
-            domain: self,
-            participant: p,
-            entry,
-        }
+        Guard::new(p, entry)
     }
 
     /// Retire `f`, to run once every reader pinned now has unpinned.
@@ -184,49 +181,112 @@ impl Drop for Domain {
     }
 }
 
+/// A guard is one word: the participant pointer with its pin entry packed
+/// into the low bits.
+///
+/// `Participant` is `#[repr(align(128))]`, so the low seven bits of any
+/// pointer to one are zero. An entry index needs three of them.
+///
+/// The size is not incidental. A guard's cost is not only what it takes to
+/// create: a caller that returns one from a hot lookup pays for its size on
+/// every call. WorkTable's `partition_ref` builds a `PartRef { guard, &T }`
+/// and drops it per lookup, and at three words that measured 3.6 ns against
+/// 3.2 ns for the single-word `crossbeam-epoch` guard it replaced, even
+/// though this crate's *pin* is the faster of the two in isolation.
+const ENTRY_MASK: usize = 0b111;
+
+/// The wildcard tag. Entries are stored as `entry + 1`, leaving zero free to
+/// mean "no entry", which is what a thread past [`PINS_PER_THREAD`] gets.
+const WILDCARD_TAG: usize = 0;
+
+// If the entry count ever outgrows the tag, the packing is silently wrong,
+// so refuse to compile instead.
+const _: () = assert!(PINS_PER_THREAD < ENTRY_MASK);
+const _: () = assert!(align_of::<Participant>() > ENTRY_MASK);
+
 /// Holds a thread's pin open. Dropping it releases the pin.
 ///
-/// Not `Send`: a pin belongs to the thread that took it.
+/// Not `Send`, and the marker below is what enforces it. A guard names the
+/// slot of the thread that took it, so dropping one on another thread would
+/// store `NO_DOMAIN` into the *original* thread's slot while that thread is
+/// still reading, and would decrement the wrong thread's `DEPTH`. Both are
+/// use-after-free windows.
+///
+/// 0.1.0 documented this and did not enforce it: every field was `Send`, so
+/// the auto trait applied and the sentence above was decoration. This test is
+/// the enforcement.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<ps_reclaim::Guard<'static>>();
+/// ```
 pub struct Guard<'a> {
-    domain: &'a Domain,
-    /// Cached so unpinning is one store with no registry lookup.
-    participant: &'static Participant,
-    /// This guard's pin entry, or `usize::MAX` for the wildcard.
-    entry: usize,
+    /// The participant pointer, with this guard's pin entry in its low bits.
+    ///
+    /// A raw pointer rather than a `usize` for two reasons: it keeps the
+    /// provenance (a `usize` round trip is rejected under Miri's strict
+    /// provenance mode), and it makes the guard `!Send` and `!Sync` by
+    /// construction rather than by a marker someone can delete.
+    packed: *const Participant,
+    /// Borrows the domain without storing it. Keeping a `&Domain` field
+    /// would double the size for the sake of two convenience methods; a
+    /// caller that wants to retire has the domain in hand already, because
+    /// it needed one to pin.
+    domain: PhantomData<&'a Domain>,
 }
 
 impl Guard<'_> {
-    /// The domain this guard pins.
-    pub fn domain(&self) -> &Domain {
-        self.domain
+    #[inline]
+    fn new(participant: &'static Participant, entry: usize) -> Self {
+        let tag = if entry == usize::MAX {
+            WILDCARD_TAG
+        } else {
+            entry + 1
+        };
+        Self {
+            packed: (participant as *const Participant).map_addr(|addr| addr | tag),
+            domain: PhantomData,
+        }
     }
 
-    /// Retire `f` under this guard. See [`Domain::retire`].
-    pub fn retire<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.domain.retire(f);
+    #[inline]
+    fn participant(&self) -> &'static Participant {
+        // Safety: `packed` was built from a `&'static Participant` whose
+        // alignment guarantees the masked bits were zero, so this restores
+        // exactly the pointer that went in.
+        unsafe { &*self.packed.map_addr(|addr| addr & !ENTRY_MASK) }
+    }
+
+    /// This guard's pin entry, or `None` for the wildcard.
+    #[inline]
+    fn entry(&self) -> Option<usize> {
+        match self.packed.addr() & ENTRY_MASK {
+            WILDCARD_TAG => None,
+            tag => Some(tag - 1),
+        }
     }
 }
 
 impl Drop for Guard<'_> {
     #[inline]
     fn drop(&mut self) {
-        let p = self.participant;
-        if self.entry == usize::MAX {
-            p.wildcard.fetch_sub(1, Ordering::Release);
-        } else {
-            // Release, so a reclaimer that sees the slot free also sees every
-            // access this reader made while pinned.
-            p.pins[self.entry].store(NO_DOMAIN, Ordering::Release);
-            // Only the LIFO case restores the fast path. Anything else leaves
-            // `DEPTH` high, which costs a cold scan and never correctness.
-            DEPTH.with(|d| {
-                if self.entry + 1 == d.get() {
-                    d.set(self.entry);
-                }
-            });
+        let p = self.participant();
+        match self.entry() {
+            None => {
+                p.wildcard.fetch_sub(1, Ordering::Release);
+            }
+            Some(entry) => {
+                // Release, so a reclaimer that sees the slot free also sees every
+                // access this reader made while pinned.
+                p.pins[entry].store(NO_DOMAIN, Ordering::Release);
+                // Only the LIFO case restores the fast path. Anything else leaves
+                // `DEPTH` high, which costs a cold scan and never correctness.
+                DEPTH.with(|d| {
+                    if entry + 1 == d.get() {
+                        d.set(entry);
+                    }
+                });
+            }
         }
     }
 }
