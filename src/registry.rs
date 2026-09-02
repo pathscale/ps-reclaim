@@ -126,3 +126,25 @@ pub(crate) fn participant() -> &'static Participant {
 pub fn slots_in_use() -> usize {
     Registry::get().next.load(Ordering::Relaxed)
 }
+
+impl Registry {
+    /// The slots a scan has to look at: every slot ever handed out.
+    ///
+    /// A slot is only ever handed out by `acquire`, which bumps `next`, and
+    /// `release` returns the index to the free list without lowering `next`.
+    /// So slots at or above this index have never been leased to a thread and
+    /// their pins are still the `NO_DOMAIN` they were constructed with: a
+    /// reader cannot appear in one without first taking a lease, which would
+    /// have raised `next` before the pin was published.
+    ///
+    /// Reading it `Relaxed` is enough because it can only grow, and a scan
+    /// that observes a stale smaller value is one that ran before the thread
+    /// in question could pin. That thread's `pin` publishes with a `SeqCst`
+    /// fence and `advance` reads with one, which is the ordering that makes a
+    /// concurrent pin visible; the bound only decides how far to look, and a
+    /// pin newer than the bound is newer than the fence too.
+    pub(crate) fn active_slots(&self) -> &[Participant] {
+        let leased = self.next.load(Ordering::Relaxed).min(MAX_THREADS);
+        &self.slots[..leased]
+    }
+}
