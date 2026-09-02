@@ -81,6 +81,18 @@ impl Domain {
         //
         // Depth zero means this thread holds no pin, so every entry is free.
         // Depth only returns to zero when the sole outstanding guard drops.
+        // A thread sharing the overflow slot must not touch `pins`: those
+        // entries are not per-thread there, so another overflow thread's guard
+        // drop would clear this pin and expose this reader to reclamation. The
+        // wildcard is a count, so it composes across however many threads
+        // share the slot, at the cost of stopping reclamation entirely while
+        // any of them is pinned. Conservative, and correct.
+        if crate::registry::is_shared_slot() {
+            p.wildcard.fetch_add(1, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+            return Guard::new(p, usize::MAX);
+        }
+
         let entry = if DEPTH.with(|d| d.get()) == 0 {
             p.pins[0].store(packed, Ordering::Relaxed);
             DEPTH.with(|d| d.set(1));
