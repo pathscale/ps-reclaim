@@ -10,8 +10,8 @@ repository = "https://github.com/pathscale/ps-reclaim"
 
 [dev-dependencies]
 # Only to measure against what this replaces. Not a runtime dependency.
-crossbeam-epoch = "0.9.18"
-seize = "0.5.1"
+crossbeam-epoch = "0.9"
+seize = "0.5"
 criterion = "0.5"
 
 [[bench]]

@@ -62,15 +62,38 @@ impl Registry {
         })
     }
 
-    fn acquire(&self) -> usize {
+    /// A slot, and whether this thread had to share the overflow one.
+    ///
+    /// Sharing is not "sound but contended", which is what this used to claim.
+    /// A slot's pins are single values, not a counted aggregate: two threads on
+    /// one slot both write `pins[0]`, and the first to drop its guard stores
+    /// `NO_DOMAIN` over a pin the other still holds. The reclaimer then reads
+    /// that slot as idle and is free to reclaim something the second thread is
+    /// still reading. That is a use-after-free, not a delay.
+    ///
+    /// So the overflow slot is reported, and callers put those threads on the
+    /// wildcard instead, which *is* a counter and therefore composes.
+    fn acquire(&self) -> (usize, bool) {
         if let Some(idx) = self.free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-            return idx;
+            return (idx, false);
         }
         let idx = self.next.fetch_add(1, Ordering::Relaxed);
-        idx.min(MAX_THREADS - 1)
+        if idx < MAX_THREADS - 1 {
+            (idx, false)
+        } else {
+            (MAX_THREADS - 1, true)
+        }
     }
 
-    fn release(&self, idx: usize) {
+    fn release(&self, idx: usize, shared: bool) {
+        // A shared slot belongs to every overflow thread at once. Clearing its
+        // pins or resetting its wildcard here would erase state those other
+        // threads still depend on, which is the same defect as sharing the
+        // pins in the first place. An overflow thread never writes `pins`, and
+        // its wildcard is decremented by its own guard, so leaving is nothing.
+        if shared {
+            return;
+        }
         let p = &self.slots[idx];
         for pin in &p.pins {
             pin.store(NO_DOMAIN, Ordering::Release);
@@ -86,11 +109,11 @@ impl Registry {
 }
 
 /// Returns this thread's slot when the thread exits.
-struct SlotLease(usize);
+struct SlotLease(usize, bool);
 
 impl Drop for SlotLease {
     fn drop(&mut self) {
-        Registry::get().release(self.0);
+        Registry::get().release(self.0, self.1);
     }
 }
 
@@ -99,6 +122,9 @@ thread_local! {
     /// `Vec`. Doing both on pin and unpin measured four times the cost of the
     /// pin itself.
     static MINE: Cell<Option<&'static Participant>> = const { Cell::new(None) };
+    /// Whether this thread shares the overflow slot, and so must pin through
+    /// the wildcard rather than through `pins`.
+    static SHARED: Cell<bool> = const { Cell::new(false) };
     static LEASE: std::cell::RefCell<Option<SlotLease>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -110,14 +136,25 @@ pub(crate) fn participant() -> &'static Participant {
         return p;
     }
     let registry = Registry::get();
-    let idx = registry.acquire();
+    let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];
     MINE.with(|m| m.set(Some(p)));
+    SHARED.with(|s| s.set(shared));
     // Installed separately so its `Drop` runs at thread exit. Failing during
     // TLS teardown leaks one slot rather than recycling it, which is why
     // `acquire` is bounded rather than fallible.
-    let _ = LEASE.try_with(|l| *l.borrow_mut() = Some(SlotLease(idx)));
+    let _ = LEASE.try_with(|l| *l.borrow_mut() = Some(SlotLease(idx, shared)));
     p
+}
+
+/// Whether this thread shares the overflow slot.
+///
+/// Such a thread cannot use `pins`: the entries are not per-thread, so any
+/// other overflow thread's guard drop would clear its pin. It pins through the
+/// wildcard, which is a count and therefore survives a concurrent release.
+#[inline]
+pub(crate) fn is_shared_slot() -> bool {
+    SHARED.with(|s| s.get())
 }
 
 /// Slots handed out so far. Diagnostic: past [`MAX_THREADS`] every further
