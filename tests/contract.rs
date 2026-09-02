@@ -220,3 +220,94 @@ fn a_guard_is_one_word() {
         "a guard grew; anything returning one from a hot path pays for it per call"
     );
 }
+
+/// A retirement made on one thread must be runnable from another.
+///
+/// Ported from WorkTable's `markers_flushed_on_another_thread_are_collectable_here`,
+/// which was deleted along with the epoch module this crate replaces. The
+/// property is not implementation detail: a scheme that parks retirements in
+/// thread-local state and reclaims them only from the retiring thread will pass
+/// every single-threaded test here and then leak in a server, where the thread
+/// that retired a page is idle and some other thread runs maintenance.
+///
+/// The retiring thread deliberately stays *alive and unpinned* while the main
+/// thread advances. Letting it exit would prove something weaker, because a
+/// scheme could flush on thread teardown and still be wrong for a live pool.
+#[test]
+fn a_retirement_from_another_thread_runs_here() {
+    let domain = Arc::new(Domain::new());
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    let (retired_tx, retired) = mpsc::channel();
+    let (release, wait_for_release) = mpsc::channel::<()>();
+    let d = domain.clone();
+    let h = hits.clone();
+    let thread = std::thread::spawn(move || {
+        d.retire(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+        retired_tx.send(()).unwrap();
+        let _ = wait_for_release.recv();
+    });
+    retired.recv().unwrap();
+
+    drive(&domain, &hits, 1);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a retirement made on another thread was not reachable from this one"
+    );
+
+    release.send(()).unwrap();
+    thread.join().unwrap();
+}
+
+/// Using many domains must not disturb a guard held on one of them.
+///
+/// Ported from WorkTable's `cache_rotation_keeps_pinning_sound`. That test
+/// registered more domains than a per-thread handle cache could hold and
+/// checked that evicting the cached handle did not silently unpin the live
+/// guard. This crate has no such cache, so the mechanism is gone - but the
+/// property it protected is not implementation-specific: whatever per-thread
+/// bookkeeping a scheme keeps, exercising unrelated domains must never make a
+/// held guard stop counting.
+///
+/// It is worth keeping precisely because the failure is silent. Nothing
+/// crashes; a reader simply stops holding its retirement back, and the memory
+/// is freed underneath it.
+#[test]
+fn many_domains_do_not_disturb_a_live_guard() {
+    let domains: Vec<Domain> = (0..64).map(|_| Domain::new()).collect();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    // A live guard on the first domain, held across everything below.
+    let held = domains[0].pin();
+    let h = hits.clone();
+    domains[0].retire(move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+
+    // Churn every other domain: pin, advance, release. Each acquires and frees
+    // whatever per-thread state the scheme uses.
+    for d in &domains[1..] {
+        let g = d.pin();
+        std::hint::black_box(&g);
+        drop(g);
+        d.advance();
+    }
+
+    drive(&domains[0], &hits, 1);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "churning unrelated domains released a guard that was still held"
+    );
+
+    drop(held);
+    drive(&domains[0], &hits, 1);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the retirement never ran once the guard was dropped"
+    );
+}
