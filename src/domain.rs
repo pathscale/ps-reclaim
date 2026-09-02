@@ -127,6 +127,23 @@ impl Domain {
     /// *after* it does not hold it up, which is what lets reclamation progress
     /// under continuous read traffic.
     pub fn advance(&self) -> usize {
+        // Nothing retired means nothing to reclaim, and the whole body below
+        // exists only to decide what is safe to reclaim. Checking first turns
+        // an advance on an empty domain from a full registry sweep plus two
+        // allocations into one uncontended lock and a length read.
+        //
+        // This matters because callers advance far more often than they
+        // retire: WorkTable calls it on every mutation of a versioned page,
+        // and the common case is that the previous call already drained.
+        if self
+            .garbage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return 0;
+        }
+
         // Paired with the fence in `pin`.
         fence(Ordering::SeqCst);
 
@@ -136,7 +153,11 @@ impl Domain {
         // advances to free anything, because a retirement stamped with the
         // current epoch is not strictly less than it.
         let mut min_pinned = now + 1;
-        for p in &Registry::get().slots {
+        // Only slots that have ever been leased. A 256-slot registry scanned
+        // in full is 1024 `Acquire` loads across 256 cache lines (each
+        // `Participant` is `repr(align(128))`), which is 32 KiB of traffic to
+        // read what is, in a process with eight threads, eight live slots.
+        for p in Registry::get().active_slots() {
             if p.wildcard.load(Ordering::Acquire) != 0 {
                 // Someone is conservatively pinned everywhere.
                 return 0;
@@ -151,13 +172,18 @@ impl Domain {
 
         let expired: Vec<Deferred> = {
             let mut garbage = self.garbage.lock().unwrap_or_else(|e| e.into_inner());
-            let (run, keep) = std::mem::take(&mut *garbage)
-                .into_iter()
-                // Strictly less than: something retired in the same epoch a
-                // reader pinned in may still be reachable by that reader.
-                .partition::<Vec<_>, _>(|(e, _)| *e < min_pinned);
-            *garbage = keep;
-            run.into_iter().map(|(_, f)| f).collect()
+            // Strictly less than: something retired in the same epoch a reader
+            // pinned in may still be reachable by that reader.
+            //
+            // `extract_if` drains in place. The previous `partition` moved the
+            // whole queue into two fresh `Vec`s and wrote one back on every
+            // call, so a domain holding a long backlog paid for the backlog on
+            // each advance even when nothing had expired. Retirements are
+            // pushed in epoch order, so this preserves order in both halves.
+            garbage
+                .extract_if(.., |(e, _)| *e < min_pinned)
+                .map(|(_, f)| f)
+                .collect()
         };
 
         // Outside the lock: a retirement may retire more.
