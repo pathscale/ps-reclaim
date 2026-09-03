@@ -134,7 +134,10 @@ impl Domain {
     /// Run every retirement whose grace period has expired, then advance the
     /// epoch one step. Returns how many ran.
     ///
-    /// Never blocks. While a reader pinned before a retirement is still
+    /// Never waits for readers, which is the property that matters and is not
+    /// the same as never blocking: this takes the domain's own garbage lock,
+    /// twice, so it is not lock-free. What it does not do is wait for a
+    /// quiescent state. While a reader pinned before a retirement is still
     /// pinned, that retirement is simply not run yet. A reader that started
     /// *after* it does not hold it up, which is what lets reclamation progress
     /// under continuous read traffic.

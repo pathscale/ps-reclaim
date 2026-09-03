@@ -104,7 +104,7 @@ criterion_main!(benches);
 fn registry_pressure(_c: &mut Criterion) {
     eprintln!(
         "registry slots handed out: {} (max {})",
-        ps_reclaim::slots_in_use(),
+        ps_reclaim::slots_handed_out(),
         ps_reclaim::MAX_THREADS
     );
 }
