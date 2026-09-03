@@ -157,10 +157,17 @@ pub(crate) fn is_shared_slot() -> bool {
     SHARED.with(|s| s.get())
 }
 
-/// Slots handed out so far. Diagnostic: past [`MAX_THREADS`] every further
-/// thread shares the last slot, which is sound but contended, and shows up as
-/// a sudden loss of flatness.
-pub fn slots_in_use() -> usize {
+/// Slots handed out so far, which is a high-water mark and not a live count.
+///
+/// `release` returns an index to the free list without lowering this, so a
+/// process that started and joined many threads reads high while few are live.
+/// That is deliberate and it is what the diagnostic wants: past
+/// [`MAX_THREADS`] every further thread shares the last slot, which is sound
+/// but contended, and only the high-water mark shows that happened at all. A
+/// live count would fall back to a flat number afterwards and hide it.
+///
+/// It was called `slots_in_use`, which said the opposite of what it returns.
+pub fn slots_handed_out() -> usize {
     Registry::get().next.load(Ordering::Relaxed)
 }
 

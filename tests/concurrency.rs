@@ -289,9 +289,9 @@ fn short_lived_threads_return_their_slots() {
     }
     // 64 sequential threads must not have consumed 64 slots.
     assert!(
-        ps_reclaim::slots_in_use() < 64,
+        ps_reclaim::slots_handed_out() < 64,
         "slots were not reused: {} handed out for 64 sequential threads",
-        ps_reclaim::slots_in_use()
+        ps_reclaim::slots_handed_out()
     );
 }
 
