@@ -268,6 +268,40 @@ fn nested_pins_past_the_slot_count_still_release() {
     );
 }
 
+/// A hole left by an out-of-order drop is reused without falling back to the
+/// process-wide wildcard. WorkTable nests its page and index domains on every
+/// select, so this is both a correctness property and a hot-path contract.
+#[test]
+fn out_of_order_drop_reuses_the_exact_pin_slot() {
+    let held_domain = Domain::new();
+    let unrelated = Domain::new();
+    let a = held_domain.pin();
+    let b = held_domain.pin();
+    let c = held_domain.pin();
+    let d = held_domain.pin();
+    drop(b);
+    let replacement = held_domain.pin();
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&ran);
+    unrelated.retire(move || {
+        counter.fetch_add(1, Ordering::Release);
+    });
+    for _ in 0..4 {
+        unrelated.advance();
+    }
+    assert_eq!(
+        ran.load(Ordering::Acquire),
+        1,
+        "reusing a free nested slot incorrectly published a wildcard pin"
+    );
+
+    drop(replacement);
+    drop(d);
+    drop(c);
+    drop(a);
+}
+
 /// Many short-lived threads reuse slots rather than exhausting the registry.
 ///
 /// A slot is returned on thread exit. Without that, a process spawning threads
