@@ -11,9 +11,9 @@ use crate::registry::{
 static NEXT_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    /// Pins this thread currently holds. A hint, not an authority: it is only
-    /// trusted when zero, which is the one case that proves every entry free.
-    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Occupied entries in this thread's participant slot. Guards are `!Send`,
+    /// so this is exact rather than a hint and handles out-of-order drops.
+    static PIN_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
 type Deferred = Box<dyn FnOnce() + Send + 'static>;
@@ -72,15 +72,16 @@ impl Domain {
         let e = self.epoch.load(Ordering::Relaxed);
         let packed = (e << DOMAIN_BITS) | (self.id & DOMAIN_MASK);
 
-        // Depth lives in a thread-local `Cell`, not in the slot, so the fast
+        // Occupancy lives in a thread-local `Cell`, not in the slot, so the fast
         // path never loads the address it is about to store to. Reading
         // `pins[0]` first cost 2 ns: the fence cannot drain until the store
         // issues, and the store could not issue until that same-address load
         // resolved. `crossbeam` sidesteps it the same way, by testing its
-        // `guard_count` rather than the epoch it is about to write.
+        // `guard_count` rather than the epoch it is about to write. A bit mask
+        // also makes a second-domain pin cheap: WorkTable deliberately holds
+        // its page domain while looking through an index domain.
         //
-        // Depth zero means this thread holds no pin, so every entry is free.
-        // Depth only returns to zero when the sole outstanding guard drops.
+        // A zero mask means this thread holds no pin, so every entry is free.
         // A thread sharing the overflow slot must not touch `pins`: those
         // entries are not per-thread there, so another overflow thread's guard
         // drop would clear this pin and expose this reader to reclamation. The
@@ -93,13 +94,18 @@ impl Domain {
             return Guard::new(p, usize::MAX);
         }
 
-        let entry = if DEPTH.with(|d| d.get()) == 0 {
-            p.pins[0].store(packed, Ordering::Relaxed);
-            DEPTH.with(|d| d.set(1));
-            0
-        } else {
-            nested_entry(p, packed)
-        };
+        let entry = PIN_MASK.with(|occupied| {
+            let mask = occupied.get();
+            let free = (!mask).trailing_zeros() as usize;
+            if free < PINS_PER_THREAD {
+                p.pins[free].store(packed, Ordering::Relaxed);
+                occupied.set(mask | (1_u8 << free));
+                free
+            } else {
+                p.wildcard.fetch_add(1, Ordering::Relaxed);
+                usize::MAX
+            }
+        });
 
         // Publish the pin before any protected pointer is loaded. Paired with
         // the fence in `advance`; without both, a reclaimer can read this slot
@@ -320,34 +326,10 @@ impl Drop for Guard<'_> {
                 // Release, so a reclaimer that sees the slot free also sees every
                 // access this reader made while pinned.
                 p.pins[entry].store(NO_DOMAIN, Ordering::Release);
-                // Only the LIFO case restores the fast path. Anything else leaves
-                // `DEPTH` high, which costs a cold scan and never correctness.
-                DEPTH.with(|d| {
-                    if entry + 1 == d.get() {
-                        d.set(entry);
-                    }
+                PIN_MASK.with(|occupied| {
+                    occupied.set(occupied.get() & !(1_u8 << entry));
                 });
             }
         }
     }
-}
-
-/// Find an entry when this thread already holds a pin.
-///
-/// Cold: only reached when a thread pins a second domain while still holding
-/// the first, which this crate's callers do not do on a hot path.
-#[cold]
-#[inline(never)]
-fn nested_entry(p: &'static Participant, packed: u64) -> usize {
-    // Scans from zero: an out-of-order guard drop can leave `DEPTH` above the
-    // real nesting, and this recovers the free entries rather than spending
-    // the wildcard.
-    for i in 0..PINS_PER_THREAD {
-        if p.pins[i].load(Ordering::Relaxed) == NO_DOMAIN {
-            p.pins[i].store(packed, Ordering::Relaxed);
-            return i;
-        }
-    }
-    p.wildcard.fetch_add(1, Ordering::Relaxed);
-    usize::MAX
 }
