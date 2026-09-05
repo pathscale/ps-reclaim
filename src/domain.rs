@@ -15,6 +15,14 @@ thread_local! {
     /// so this is exact rather than a hint and handles out-of-order drops.
     static PIN_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+const _: () = assert!(PINS_PER_THREAD <= u8::BITS as usize);
+
+#[cold]
+#[inline(never)]
+fn pin_wildcard(participant: &Participant) -> usize {
+    participant.wildcard.fetch_add(1, Ordering::Relaxed);
+    usize::MAX
+}
 
 type Deferred = Box<dyn FnOnce() + Send + 'static>;
 
@@ -88,24 +96,26 @@ impl Domain {
         // wildcard is a count, so it composes across however many threads
         // share the slot, at the cost of stopping reclamation entirely while
         // any of them is pinned. Conservative, and correct.
-        if crate::registry::is_shared_slot() {
-            p.wildcard.fetch_add(1, Ordering::Relaxed);
-            fence(Ordering::SeqCst);
-            return Guard::new(p, usize::MAX);
-        }
-
-        let entry = PIN_MASK.with(|occupied| {
-            let mask = occupied.get();
-            let free = (!mask).trailing_zeros() as usize;
-            if free < PINS_PER_THREAD {
-                p.pins[free].store(packed, Ordering::Relaxed);
-                occupied.set(mask | (1_u8 << free));
-                free
-            } else {
-                p.wildcard.fetch_add(1, Ordering::Relaxed);
-                usize::MAX
-            }
-        });
+        let entry = if crate::registry::is_shared_slot() {
+            pin_wildcard(p)
+        } else {
+            PIN_MASK.with(|occupied| {
+                let mask = occupied.get();
+                if mask == 0 {
+                    p.pins[0].store(packed, Ordering::Relaxed);
+                    occupied.set(1);
+                    return 0;
+                }
+                let free = (!mask).trailing_zeros() as usize;
+                if free < PINS_PER_THREAD {
+                    p.pins[free].store(packed, Ordering::Relaxed);
+                    occupied.set(mask | (1_u8 << free));
+                    free
+                } else {
+                    pin_wildcard(p)
+                }
+            })
+        };
 
         // Publish the pin before any protected pointer is loaded. Paired with
         // the fence in `advance`; without both, a reclaimer can read this slot
@@ -148,6 +158,20 @@ impl Domain {
     /// *after* it does not hold it up, which is what lets reclamation progress
     /// under continuous read traffic.
     pub fn advance(&self) -> usize {
+        self.advance_up_to(usize::MAX)
+    }
+
+    /// Run at most `limit` retirements whose grace period has expired, then
+    /// advance the epoch one step. Returns how many ran.
+    ///
+    /// This has the same reader-safety and non-blocking grace-period semantics
+    /// as [`Self::advance`], but bounds destructor work charged to the caller.
+    /// Eligible retirements beyond `limit` stay queued for a later pass.
+    pub fn advance_up_to(&self, limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+
         // Nothing retired means nothing to reclaim, and the whole body below
         // exists only to decide what is safe to reclaim. Checking first turns
         // an advance on an empty domain from a full registry sweep plus two
@@ -203,6 +227,7 @@ impl Domain {
             // pushed in epoch order, so this preserves order in both halves.
             garbage
                 .extract_if(.., |(e, _)| *e < min_pinned)
+                .take(limit)
                 .map(|(_, f)| f)
                 .collect()
         };
@@ -256,8 +281,8 @@ const _: () = assert!(align_of::<Participant>() > ENTRY_MASK);
 /// Not `Send`, and the marker below is what enforces it. A guard names the
 /// slot of the thread that took it, so dropping one on another thread would
 /// store `NO_DOMAIN` into the *original* thread's slot while that thread is
-/// still reading, and would decrement the wrong thread's `DEPTH`. Both are
-/// use-after-free windows.
+/// still reading, and would clear the wrong thread-local occupancy bit. Both
+/// are use-after-free windows.
 ///
 /// 0.1.0 documented this and did not enforce it: every field was `Send`, so
 /// the auto trait applied and the sentence above was decoration. This test is

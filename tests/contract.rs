@@ -160,6 +160,31 @@ fn nothing_is_reclaimed_without_advance() {
     assert_eq!(domain.pending(), 0);
 }
 
+#[test]
+fn bounded_advance_never_runs_more_than_the_requested_limit() {
+    let domain = Domain::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..23 {
+        let h = hits.clone();
+        domain.retire(move || {
+            h.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    assert_eq!(domain.advance_up_to(7), 7);
+    assert_eq!(hits.load(Ordering::SeqCst), 7);
+    assert_eq!(domain.pending(), 16);
+
+    assert_eq!(domain.advance_up_to(7), 7);
+    assert_eq!(hits.load(Ordering::SeqCst), 14);
+    assert_eq!(domain.pending(), 9);
+
+    assert_eq!(domain.advance(), 9);
+    assert_eq!(hits.load(Ordering::SeqCst), 23);
+    assert_eq!(domain.pending(), 0);
+}
+
 /// Domains are independent: a reader of one does not delay the other.
 #[test]
 fn domains_do_not_delay_each_other() {
