@@ -99,12 +99,10 @@ impl Registry {
             pin.store(NO_DOMAIN, Ordering::Release);
         }
         p.wildcard.store(0, Ordering::Release);
-        if idx < MAX_THREADS - 1 {
-            self.free
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(idx);
-        }
+        self.free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(idx);
     }
 }
 
