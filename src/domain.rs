@@ -360,3 +360,107 @@ impl Drop for Guard<'_> {
         }
     }
 }
+
+/// A reader's registration, held by the caller instead of looked up.
+///
+/// This is the same idea `smr-swap` uses and it exists because of a
+/// measurement: after folding the pin path's thread-locals into one, a
+/// thread-local lookup was still the largest single component of a pin, ahead
+/// of the `SeqCst` fence. A lookup that cannot be made cheaper can be made
+/// unnecessary, by having the caller carry what the lookup would have found.
+///
+/// The cost is ergonomic and it is real: a caller has to hold this and pass it
+/// down, which for a tree means threading it through the traversal. The benefit
+/// is that pinning touches no thread-local storage at all, on stable, with no
+/// platform assumptions.
+///
+/// `!Send` by construction. The participant slot behind a handle is this
+/// thread's alone and its `pins` entries are not safe to claim from two threads.
+pub struct Handle<'d> {
+    domain: &'d Domain,
+    participant: &'static Participant,
+    shared: bool,
+    /// The same mask `pin` keeps in thread-local storage, kept here instead.
+    pin_mask: core::cell::Cell<u8>,
+    lease: Option<crate::registry::SlotLease>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Domain {
+    /// Take a registration for the calling thread.
+    ///
+    /// One registry acquisition, the same one the thread-local path does on
+    /// first pin. Hold it for as long as the thread reads, and pin through it.
+    pub fn handle(&self) -> Handle<'_> {
+        let registry = Registry::get();
+        let (idx, shared) = registry.acquire();
+        Handle {
+            domain: self,
+            participant: &registry.slots[idx],
+            shared,
+            pin_mask: core::cell::Cell::new(0),
+            lease: Some(crate::registry::SlotLease(idx, shared)),
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl<'d> Handle<'d> {
+    /// Pin, with no thread-local lookup anywhere on the path.
+    #[inline]
+    pub fn pin(&self) -> HandleGuard<'_, 'd> {
+        let p = self.participant;
+        let e = self.domain.epoch.load(Ordering::Relaxed);
+        let packed = (e << DOMAIN_BITS) | (self.domain.id & DOMAIN_MASK);
+        let entry = if self.shared {
+            pin_wildcard(p)
+        } else {
+            let mask = self.pin_mask.get();
+            if mask == 0 {
+                p.pins[0].store(packed, Ordering::Relaxed);
+                self.pin_mask.set(1);
+                0
+            } else {
+                let free = (!mask).trailing_zeros() as usize;
+                if free < PINS_PER_THREAD {
+                    p.pins[free].store(packed, Ordering::Relaxed);
+                    self.pin_mask.set(mask | (1_u8 << free));
+                    free
+                } else {
+                    pin_wildcard(p)
+                }
+            }
+        };
+        fence(Ordering::SeqCst);
+        HandleGuard {
+            handle: self,
+            entry,
+        }
+    }
+}
+
+impl Drop for Handle<'_> {
+    fn drop(&mut self) {
+        drop(self.lease.take());
+    }
+}
+
+/// A pin taken through a [`Handle`].
+pub struct HandleGuard<'h, 'd> {
+    handle: &'h Handle<'d>,
+    entry: usize,
+}
+
+impl Drop for HandleGuard<'_, '_> {
+    #[inline]
+    fn drop(&mut self) {
+        let p = self.handle.participant;
+        if self.entry == usize::MAX {
+            p.wildcard.fetch_sub(1, Ordering::Release);
+        } else {
+            p.pins[self.entry].store(NO_DOMAIN, Ordering::Release);
+            let m = &self.handle.pin_mask;
+            m.set(m.get() & !(1_u8 << self.entry));
+        }
+    }
+}
