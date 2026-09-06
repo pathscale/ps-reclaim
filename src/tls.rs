@@ -1,19 +1,52 @@
 //! `thread_local!` for a build that does not link `std`.
 //!
 //! Compiled only when `std` is off. With `std` the crate keeps using
-//! `thread_local!` exactly as before, which matters more here than anywhere:
-//! three of the four per-thread values in this crate are `Cell` with `const`
-//! initialisers and no destructor, so the compiler gives them the
-//! `#[thread_local]` fast path, a load at a register offset. That is what the
-//! comment on `MINE` means by "doing both on pin and unpin measured four times
-//! the cost of the pin itself".
+//! `thread_local!` exactly as before.
 //!
-//! There is no equivalent without `std`. `pthread_getspecific` is a call, and
-//! the key has to be found before it. So the `no_std` pin path is slower than
-//! the `std` one by construction, and the fix is not a better `Tls`: it is to
-//! fold the four per-thread values into one, so there is one lookup instead of
-//! four. That is a change to the hot path of a lock-free crate and it wants its
-//! own measurement, so it is not in the change that introduced this file.
+//! # What this costs, measured rather than assumed
+//!
+//! An earlier version of this comment said the `no_std` pin path is slower than
+//! the `std` one *by construction*. That was wrong twice over, and the
+//! correction is worth more than the original claim.
+//!
+//! It is wrong on this platform. On Mach-O, `std`'s thread-local is itself a
+//! call: both `#[thread_local]` and a `const`-initialised `thread_local!`
+//! compile at `-O` to five instructions ending in `blr x8`, through a TLV
+//! descriptor, before the variable is addressed. So both options here are a
+//! call and the only difference is which function you land in. Fifty million
+//! accesses each, three interleaved rounds on an M4 Max, with the same
+//! `thread_local!` arm measured twice per round as the null:
+//!
+//! ```text
+//!            thread_local!   pthread_getspecific   null (macro again)
+//!   round 1       1.71 ns              1.41 ns             1.19 ns
+//!   round 2       1.17 ns              1.40 ns             1.20 ns
+//!   round 3       1.19 ns              1.36 ns             1.16 ns
+//! ```
+//!
+//! The gap between the mechanisms is about 0.2 ns; the null moves by 0.5 on a
+//! bad round. There is no penalty here to speak of.
+//!
+//! It is also wrong in principle, which matters more, because it would have
+//! sent someone looking for a cleverer `Tls`. **The fast path is not gated on
+//! `std`, it is gated on the feature being stable.** `std`'s own fast path *is*
+//! `#[thread_local]`, in `sys/thread_local/native/`, and a `no_std` crate on
+//! nightly can write that attribute and get identical codegen. On ELF, where
+//! local-exec collapses to a register plus an offset, that is the whole win
+//! with no `std` involved. What `std` genuinely owns is the destructor
+//! plumbing: the weak `__cxa_thread_atexit_impl` lookup, Apple's `_tlv_atexit`,
+//! and the Windows `.CRT$XLB` callback, and even those are reachable through
+//! `libc`.
+//!
+//! # What actually costs, then
+//!
+//! The count, not the mechanism. Four thread-locals on the pin path is four
+//! calls at roughly 1.4 ns whichever mechanism is chosen, and three of the four
+//! values here have no destructor and could share one slot. Folding `MINE`,
+//! `SHARED` and `PIN_MASK` into a single struct is worth about 2.8 ns per pin,
+//! which is a larger number than anything in the table above. That is a change
+//! to the hot path of a lock-free crate and wants its own measurement, so it is
+//! not in the change that introduced this file.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};
