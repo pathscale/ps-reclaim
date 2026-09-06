@@ -5,9 +5,11 @@
 //! there is a domain per table and a per-domain array would cost megabytes at
 //! a thousand tables.
 
-use std::cell::Cell;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::Mutex;
+use alloc::vec::Vec;
+use core::cell::Cell;
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// See [`crate::MAX_THREADS`].
 pub(crate) const MAX_THREADS: usize = 256;
@@ -54,8 +56,8 @@ pub(crate) struct Registry {
 
 impl Registry {
     pub(crate) fn get() -> &'static Registry {
-        static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
-        REGISTRY.get_or_init(|| Registry {
+        static REGISTRY: crate::sync::OnceLock<Registry> = crate::sync::OnceLock::new();
+        crate::sync::get_or_init(&REGISTRY, || Registry {
             slots: (0..MAX_THREADS).map(|_| Participant::new()).collect(),
             free: Mutex::new(Vec::new()),
             next: AtomicUsize::new(0),
@@ -74,7 +76,7 @@ impl Registry {
     /// So the overflow slot is reported, and callers put those threads on the
     /// wildcard instead, which *is* a counter and therefore composes.
     fn acquire(&self) -> (usize, bool) {
-        if let Some(idx) = self.free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        if let Some(idx) = crate::sync::lock(&self.free).pop() {
             return (idx, false);
         }
         let idx = self.next.fetch_add(1, Ordering::Relaxed);
@@ -99,10 +101,7 @@ impl Registry {
             pin.store(NO_DOMAIN, Ordering::Release);
         }
         p.wildcard.store(0, Ordering::Release);
-        self.free
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(idx);
+        crate::sync::lock(&self.free).push(idx);
     }
 }
 
@@ -115,6 +114,7 @@ impl Drop for SlotLease {
     }
 }
 
+#[cfg(feature = "std")]
 thread_local! {
     /// Cached so the read path touches neither the `OnceLock` nor the slot
     /// `Vec`. Doing both on pin and unpin measured four times the cost of the
@@ -123,25 +123,78 @@ thread_local! {
     /// Whether this thread shares the overflow slot, and so must pin through
     /// the wildcard rather than through `pins`.
     static SHARED: Cell<bool> = const { Cell::new(false) };
-    static LEASE: std::cell::RefCell<Option<SlotLease>> =
-        const { std::cell::RefCell::new(None) };
+    static LEASE: RefCell<Option<SlotLease>> = const { RefCell::new(None) };
+}
+
+// Without `std` each of these is a `pthread_key_t`. Three lookups where `std`
+// has three register offsets, which is the cost named in `src/tls.rs`, along
+// with the fold that would remove it.
+#[cfg(not(feature = "std"))]
+static MINE: crate::tls::Tls<Cell<Option<&'static Participant>>> = crate::tls::Tls::new();
+#[cfg(not(feature = "std"))]
+static SHARED: crate::tls::Tls<Cell<bool>> = crate::tls::Tls::new();
+#[cfg(not(feature = "std"))]
+static LEASE: crate::tls::Tls<RefCell<Option<SlotLease>>> = crate::tls::Tls::new();
+
+#[cfg(feature = "std")]
+#[inline]
+fn with_mine<R>(f: impl FnOnce(&Cell<Option<&'static Participant>>) -> R) -> R {
+    MINE.with(f)
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn with_mine<R>(f: impl FnOnce(&Cell<Option<&'static Participant>>) -> R) -> R {
+    MINE.with(|| Cell::new(None), f)
+        .expect("thread-local storage is gone during teardown")
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn with_shared<R>(f: impl FnOnce(&Cell<bool>) -> R) -> R {
+    SHARED.with(f)
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn with_shared<R>(f: impl FnOnce(&Cell<bool>) -> R) -> R {
+    SHARED
+        .with(|| Cell::new(false), f)
+        .expect("thread-local storage is gone during teardown")
+}
+
+/// Install this thread's lease, whose `Drop` returns the slot at thread exit.
+///
+/// Failure is tolerated on purpose, which is why this returns nothing: losing
+/// the lease during teardown leaks one slot rather than recycling it, and
+/// `acquire` is bounded rather than fallible for exactly that reason.
+#[cfg(feature = "std")]
+#[inline]
+fn install_lease(lease: SlotLease) {
+    let _ = LEASE.try_with(|l| *l.borrow_mut() = Some(lease));
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn install_lease(lease: SlotLease) {
+    let _ = LEASE.with(|| RefCell::new(None), |l| *l.borrow_mut() = Some(lease));
 }
 
 /// This thread's participant slot.
 #[inline]
 pub(crate) fn participant() -> &'static Participant {
-    if let Some(p) = MINE.with(|m| m.get()) {
+    if let Some(p) = with_mine(|m| m.get()) {
         return p;
     }
     let registry = Registry::get();
     let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];
-    MINE.with(|m| m.set(Some(p)));
-    SHARED.with(|s| s.set(shared));
+    with_mine(|m| m.set(Some(p)));
+    with_shared(|s| s.set(shared));
     // Installed separately so its `Drop` runs at thread exit. Failing during
     // TLS teardown leaks one slot rather than recycling it, which is why
     // `acquire` is bounded rather than fallible.
-    let _ = LEASE.try_with(|l| *l.borrow_mut() = Some(SlotLease(idx, shared)));
+    install_lease(SlotLease(idx, shared));
     p
 }
 
@@ -152,7 +205,7 @@ pub(crate) fn participant() -> &'static Participant {
 /// wildcard, which is a count and therefore survives a concurrent release.
 #[inline]
 pub(crate) fn is_shared_slot() -> bool {
-    SHARED.with(|s| s.get())
+    with_shared(|s| s.get())
 }
 
 /// Slots handed out so far, which is a high-water mark and not a live count.
