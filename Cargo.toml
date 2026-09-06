@@ -51,9 +51,15 @@ nightly = []
 crossbeam-epoch = "0.9"
 seize = "0.5"
 criterion = "0.5"
+# `getrusage` in `benches/burst.rs`: wall clock cannot see a burnt core.
+libc = "0.2"
 
 [[bench]]
 name = "pin"
+harness = false
+
+[[bench]]
+name = "burst"
 harness = false
 
 [lints.rust]
