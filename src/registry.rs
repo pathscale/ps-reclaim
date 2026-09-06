@@ -75,7 +75,7 @@ impl Registry {
     ///
     /// So the overflow slot is reported, and callers put those threads on the
     /// wildcard instead, which *is* a counter and therefore composes.
-    fn acquire(&self) -> (usize, bool) {
+    pub(crate) fn acquire(&self) -> (usize, bool) {
         if let Some(idx) = crate::sync::lock(&self.free).pop() {
             return (idx, false);
         }
@@ -106,7 +106,7 @@ impl Registry {
 }
 
 /// Returns this thread's slot when the thread exits.
-struct SlotLease(usize, bool);
+pub(crate) struct SlotLease(pub(crate) usize, pub(crate) bool);
 
 impl Drop for SlotLease {
     fn drop(&mut self) {

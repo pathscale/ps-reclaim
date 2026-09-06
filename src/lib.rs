@@ -62,7 +62,7 @@ mod tls;
 mod domain;
 mod registry;
 
-pub use domain::{Domain, Guard};
+pub use domain::{Domain, Guard, Handle, HandleGuard};
 pub use registry::slots_handed_out;
 
 /// Upper bound on threads holding pins at once.
