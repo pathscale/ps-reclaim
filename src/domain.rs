@@ -3,48 +3,15 @@
 use crate::sync::Mutex;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::cell::Cell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::registry::{
-    DOMAIN_BITS, DOMAIN_MASK, NO_DOMAIN, PINS_PER_THREAD, Participant, Registry, participant,
+    DOMAIN_BITS, DOMAIN_MASK, NO_DOMAIN, PINS_PER_THREAD, Participant, Registry,
 };
 
 static NEXT_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(feature = "std")]
-thread_local! {
-    /// Occupied entries in this thread's participant slot. Guards are `!Send`,
-    /// so this is exact rather than a hint and handles out-of-order drops.
-    static PIN_MASK: Cell<u8> = const { Cell::new(0) };
-}
-
-/// Without `std` the same slot is a `pthread_key_t`, which is what
-/// `thread_local!` lowers to for a type with a destructor anyway. This one has
-/// none, so `std` gets it at a register offset and this does not. See
-/// `src/tls.rs` for what that costs and what would fix it.
-#[cfg(not(feature = "std"))]
-static PIN_MASK: crate::tls::Tls<Cell<u8>> = crate::tls::Tls::new();
-
-/// Run `f` against this thread's pin mask.
-///
-/// Panics during thread teardown, which is what `thread_local!`'s `with` does,
-/// and is unreachable here: a `Guard` is `!Send` and cannot outlive the thread
-/// that made it.
-#[cfg(feature = "std")]
-#[inline]
-fn with_pin_mask<R>(f: impl FnOnce(&Cell<u8>) -> R) -> R {
-    PIN_MASK.with(f)
-}
-
-#[cfg(not(feature = "std"))]
-#[inline]
-fn with_pin_mask<R>(f: impl FnOnce(&Cell<u8>) -> R) -> R {
-    PIN_MASK
-        .with(|| Cell::new(0), f)
-        .expect("thread-local storage is gone during teardown")
-}
 const _: () = assert!(PINS_PER_THREAD <= u8::BITS as usize);
 
 #[cold]
@@ -106,46 +73,58 @@ impl Domain {
     /// fence. No shared line is written.
     #[inline]
     pub fn pin(&self) -> Guard<'_> {
-        let p = participant();
-        let e = self.epoch.load(Ordering::Relaxed);
-        let packed = (e << DOMAIN_BITS) | (self.id & DOMAIN_MASK);
-
-        // Occupancy lives in a thread-local `Cell`, not in the slot, so the fast
-        // path never loads the address it is about to store to. Reading
-        // `pins[0]` first cost 2 ns: the fence cannot drain until the store
-        // issues, and the store could not issue until that same-address load
-        // resolved. `crossbeam` sidesteps it the same way, by testing its
-        // `guard_count` rather than the epoch it is about to write. A bit mask
-        // also makes a second-domain pin cheap: WorkTable deliberately holds
-        // its page domain while looking through an index domain.
+        // One thread-local lookup for the whole pin. The participant, the
+        // shared-slot flag and the pin mask are three fields of one `Local`,
+        // and reading them through three separate lookups is what made the
+        // `no_std` build cost 22 to 40% of Arctic's burst throughput.
         //
-        // A zero mask means this thread holds no pin, so every entry is free.
-        // A thread sharing the overflow slot must not touch `pins`: those
-        // entries are not per-thread there, so another overflow thread's guard
-        // drop would clear this pin and expose this reader to reclamation. The
-        // wildcard is a count, so it composes across however many threads
-        // share the slot, at the cost of stopping reclamation entirely while
-        // any of them is pinned. Conservative, and correct.
-        let entry = if crate::registry::is_shared_slot() {
-            pin_wildcard(p)
-        } else {
-            with_pin_mask(|occupied| {
+        // The order inside is exactly what it was when these were separate:
+        // resolve the participant, then load the epoch, then claim an entry.
+        let (p, entry) = crate::registry::with_local(|local| {
+            let p = crate::registry::participant_in(local);
+            let e = self.epoch.load(Ordering::Relaxed);
+            let packed = (e << DOMAIN_BITS) | (self.id & DOMAIN_MASK);
+
+            // Occupancy lives in a thread-local `Cell`, not in the slot, so the
+            // fast path never loads the address it is about to store to.
+            // Reading `pins[0]` first cost 2 ns: the fence cannot drain until
+            // the store issues, and the store could not issue until that
+            // same-address load resolved. `crossbeam` sidesteps it the same
+            // way, by testing its `guard_count` rather than the epoch it is
+            // about to write. A bit mask also makes a second-domain pin cheap:
+            // WorkTable deliberately holds its page domain while looking
+            // through an index domain.
+            //
+            // A zero mask means this thread holds no pin, so every entry is
+            // free. A thread sharing the overflow slot must not touch `pins`:
+            // those entries are not per-thread there, so another overflow
+            // thread's guard drop would clear this pin and expose this reader
+            // to reclamation. The wildcard is a count, so it composes across
+            // however many threads share the slot, at the cost of stopping
+            // reclamation entirely while any of them is pinned. Conservative,
+            // and correct.
+            let entry = if local.shared.get() {
+                pin_wildcard(p)
+            } else {
+                let occupied = &local.pin_mask;
                 let mask = occupied.get();
                 if mask == 0 {
                     p.pins[0].store(packed, Ordering::Relaxed);
                     occupied.set(1);
-                    return 0;
-                }
-                let free = (!mask).trailing_zeros() as usize;
-                if free < PINS_PER_THREAD {
-                    p.pins[free].store(packed, Ordering::Relaxed);
-                    occupied.set(mask | (1_u8 << free));
-                    free
+                    0
                 } else {
-                    pin_wildcard(p)
+                    let free = (!mask).trailing_zeros() as usize;
+                    if free < PINS_PER_THREAD {
+                        p.pins[free].store(packed, Ordering::Relaxed);
+                        occupied.set(mask | (1_u8 << free));
+                        free
+                    } else {
+                        pin_wildcard(p)
+                    }
                 }
-            })
-        };
+            };
+            (p, entry)
+        });
 
         // Publish the pin before any protected pointer is loaded. Paired with
         // the fence in `advance`; without both, a reclaimer can read this slot
@@ -372,7 +351,9 @@ impl Drop for Guard<'_> {
                 // Release, so a reclaimer that sees the slot free also sees every
                 // access this reader made while pinned.
                 p.pins[entry].store(NO_DOMAIN, Ordering::Release);
-                with_pin_mask(|occupied| {
+                // The second and last thread-local lookup of a pin/unpin cycle.
+                crate::registry::with_local(|local| {
+                    let occupied = &local.pin_mask;
                     occupied.set(occupied.get() & !(1_u8 << entry));
                 });
             }
