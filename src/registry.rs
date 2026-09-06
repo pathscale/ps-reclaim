@@ -147,20 +147,29 @@ impl Local {
         }
     }
 }
-
 #[cfg(feature = "std")]
 thread_local! {
     static LOCAL: Local = const { Local::new() };
     static LEASE: RefCell<Option<SlotLease>> = const { RefCell::new(None) };
 }
 
-// Without `std` each of these is a `pthread_key_t`, and a lookup is a call
-// rather than a register offset. Two keys where there were four, which is the
-// point of `Local`.
-#[cfg(not(feature = "std"))]
-static LOCAL: crate::tls::Tls<Local> = crate::tls::Tls::new();
+// Without `std`, `LEASE` is a platform key because it has a destructor that
+// has to run at thread exit. That is the one thing `#[thread_local]` cannot do
+// and the one thing a platform key is genuinely needed for here.
 #[cfg(not(feature = "std"))]
 static LEASE: crate::tls::Tls<RefCell<Option<SlotLease>>> = crate::tls::Tls::new();
+
+// `Local` is the hot one and it has no destructor, so on nightly it can be the
+// same thing `thread_local!` lowers to: an address off the thread pointer, no
+// call, no key. Measured identical to `std` and roughly half the cost of
+// `pthread_getspecific`.
+#[cfg(all(not(feature = "std"), feature = "nightly"))]
+#[thread_local]
+static LOCAL: Local = Local::new();
+
+// Stable `no_std` has no way to say that, so it pays for a key.
+#[cfg(all(not(feature = "std"), not(feature = "nightly")))]
+static LOCAL: crate::tls::Tls<Local> = crate::tls::Tls::new();
 
 /// Run `f` against this thread's `Local`, which is one lookup.
 ///
@@ -173,7 +182,15 @@ pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     LOCAL.with(f)
 }
 
-#[cfg(not(feature = "std"))]
+/// No lookup at all: the address is an offset from the thread pointer, and
+/// there is no lazy-init flag because `Local::new` is a `const` initialiser.
+#[cfg(all(not(feature = "std"), feature = "nightly"))]
+#[inline]
+pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
+    f(&LOCAL)
+}
+
+#[cfg(all(not(feature = "std"), not(feature = "nightly")))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     LOCAL

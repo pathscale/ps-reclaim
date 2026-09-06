@@ -40,6 +40,12 @@ default = ["std"]
 # because neither is on the read path. See `src/sync.rs`.
 std = []
 
+# Puts `Local` behind `#[thread_local]` instead of a platform key, which is
+# what `std` does internally and costs the same. Nightly-only because the
+# attribute is unstable, and sound here only because `Local` has no destructor:
+# `#[thread_local]` never runs one.
+nightly = []
+
 [dev-dependencies]
 # Only to measure against what this replaces. Not a runtime dependency.
 crossbeam-epoch = "0.9"
