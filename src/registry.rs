@@ -1,6 +1,6 @@
 //! Process-wide participant registry.
 //!
-//! Threads register once and publish *which domains* they are pinned in. The
+//! Threads register once and pubish *which domains* they are pinned in. The
 //! registry is shared across every domain rather than owned by each, because
 //! there is a domain per table and a per-domain array would cost megabytes at
 //! a thousand tables.
@@ -114,52 +114,70 @@ impl Drop for SlotLease {
     }
 }
 
-#[cfg(feature = "std")]
-thread_local! {
+/// This thread's per-thread state, in one place.
+///
+/// It was three separate thread-locals, and `pin` touched all three while
+/// `Guard::drop` touched a fourth. That is four lookups per pin/unpin cycle,
+/// which is free where a thread-local is a register offset and is not free
+/// where it is a `pthread_getspecific` call. Measured on the burst benchmark,
+/// the `no_std` build lost 22 to 40% of Arctic's throughput to exactly this.
+///
+/// None of the three has a destructor, and they are nine bytes between them.
+/// One lookup in `pin` and one in `drop` costs half of what four did, and the
+/// grouping is honest: these three are read together, always.
+pub(crate) struct Local {
     /// Cached so the read path touches neither the `OnceLock` nor the slot
     /// `Vec`. Doing both on pin and unpin measured four times the cost of the
     /// pin itself.
-    static MINE: Cell<Option<&'static Participant>> = const { Cell::new(None) };
+    pub(crate) mine: Cell<Option<&'static Participant>>,
     /// Whether this thread shares the overflow slot, and so must pin through
     /// the wildcard rather than through `pins`.
-    static SHARED: Cell<bool> = const { Cell::new(false) };
+    pub(crate) shared: Cell<bool>,
+    /// Occupied entries in this thread's participant slot. Guards are `!Send`,
+    /// so this is exact rather than a hint and handles out-of-order drops.
+    pub(crate) pin_mask: Cell<u8>,
+}
+
+impl Local {
+    const fn new() -> Self {
+        Self {
+            mine: Cell::new(None),
+            shared: Cell::new(false),
+            pin_mask: Cell::new(0),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static LOCAL: Local = const { Local::new() };
     static LEASE: RefCell<Option<SlotLease>> = const { RefCell::new(None) };
 }
 
-// Without `std` each of these is a `pthread_key_t`. Three lookups where `std`
-// has three register offsets, which is the cost named in `src/tls.rs`, along
-// with the fold that would remove it.
+// Without `std` each of these is a `pthread_key_t`, and a lookup is a call
+// rather than a register offset. Two keys where there were four, which is the
+// point of `Local`.
 #[cfg(not(feature = "std"))]
-static MINE: crate::tls::Tls<Cell<Option<&'static Participant>>> = crate::tls::Tls::new();
-#[cfg(not(feature = "std"))]
-static SHARED: crate::tls::Tls<Cell<bool>> = crate::tls::Tls::new();
+static LOCAL: crate::tls::Tls<Local> = crate::tls::Tls::new();
 #[cfg(not(feature = "std"))]
 static LEASE: crate::tls::Tls<RefCell<Option<SlotLease>>> = crate::tls::Tls::new();
 
+/// Run `f` against this thread's `Local`, which is one lookup.
+///
+/// Callers on the hot path take this **once** and read every field they need
+/// inside the closure. Calling it three times to read three fields puts back
+/// exactly the cost this exists to remove.
 #[cfg(feature = "std")]
 #[inline]
-fn with_mine<R>(f: impl FnOnce(&Cell<Option<&'static Participant>>) -> R) -> R {
-    MINE.with(f)
+pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
+    LOCAL.with(f)
 }
 
 #[cfg(not(feature = "std"))]
 #[inline]
-fn with_mine<R>(f: impl FnOnce(&Cell<Option<&'static Participant>>) -> R) -> R {
-    MINE.with(|| Cell::new(None), f)
-        .expect("thread-local storage is gone during teardown")
-}
-
-#[cfg(feature = "std")]
-#[inline]
-fn with_shared<R>(f: impl FnOnce(&Cell<bool>) -> R) -> R {
-    SHARED.with(f)
-}
-
-#[cfg(not(feature = "std"))]
-#[inline]
-fn with_shared<R>(f: impl FnOnce(&Cell<bool>) -> R) -> R {
-    SHARED
-        .with(|| Cell::new(false), f)
+pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
+    LOCAL
+        .with(Local::new, f)
         .expect("thread-local storage is gone during teardown")
 }
 
@@ -180,32 +198,36 @@ fn install_lease(lease: SlotLease) {
     let _ = LEASE.with(|| RefCell::new(None), |l| *l.borrow_mut() = Some(lease));
 }
 
-/// This thread's participant slot.
+/// This thread's participant slot, given a `Local` the caller already holds.
+///
+/// The hot path calls this rather than `participant`, so registration and the
+/// pin that follows it share one thread-local lookup.
 #[inline]
-pub(crate) fn participant() -> &'static Participant {
-    if let Some(p) = with_mine(|m| m.get()) {
+pub(crate) fn participant_in(local: &Local) -> &'static Participant {
+    if let Some(p) = local.mine.get() {
         return p;
     }
+    register(local)
+}
+
+/// First touch on this thread: take a slot and remember it.
+///
+/// Split out and marked cold so the branch above stays a load and a null test.
+/// It reaches the registry mutex, which is the one place this crate takes a
+/// lock, and it happens once per thread.
+#[cold]
+#[inline(never)]
+fn register(local: &Local) -> &'static Participant {
     let registry = Registry::get();
     let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];
-    with_mine(|m| m.set(Some(p)));
-    with_shared(|s| s.set(shared));
+    local.mine.set(Some(p));
+    local.shared.set(shared);
     // Installed separately so its `Drop` runs at thread exit. Failing during
     // TLS teardown leaks one slot rather than recycling it, which is why
     // `acquire` is bounded rather than fallible.
     install_lease(SlotLease(idx, shared));
     p
-}
-
-/// Whether this thread shares the overflow slot.
-///
-/// Such a thread cannot use `pins`: the entries are not per-thread, so any
-/// other overflow thread's guard drop would clear its pin. It pins through the
-/// wildcard, which is a count and therefore survives a concurrent release.
-#[inline]
-pub(crate) fn is_shared_slot() -> bool {
-    with_shared(|s| s.get())
 }
 
 /// Slots handed out so far, which is a high-water mark and not a live count.
