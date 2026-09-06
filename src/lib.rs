@@ -38,7 +38,17 @@
 //! are added. `benches/pin.rs` measures it against `crossbeam-epoch` and
 //! `seize`; run it before changing anything here.
 
+// `not(test)` so the harness keeps its own prelude while the library under test
+// is the `no_std` one. `cargo check --no-default-features` is what proves the
+// library does not link `std`, since a test binary cannot.
+#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(missing_docs)]
+
+extern crate alloc;
+
+mod sync;
+#[cfg(not(feature = "std"))]
+mod tls;
 
 mod domain;
 mod registry;

@@ -1,8 +1,11 @@
-//! The grace-period domain and its guard.
+//! Th        if cratcore::mem::take(crate::sync::get_mut(&mut self.garbage))::sync::lock(&self.garbage).is_empty() { grace-period domain and its guard.
 
-use std::marker::PhantomData;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use crate::sync::Mutex;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::cell::Cell;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crate::registry::{
     DOMAIN_BITS, DOMAIN_MASK, NO_DOMAIN, PINS_PER_THREAD, Participant, Registry, participant,
@@ -10,10 +13,37 @@ use crate::registry::{
 
 static NEXT_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(feature = "std")]
 thread_local! {
     /// Occupied entries in this thread's participant slot. Guards are `!Send`,
     /// so this is exact rather than a hint and handles out-of-order drops.
-    static PIN_MASK: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PIN_MASK: Cell<u8> = const { Cell::new(0) };
+}
+
+/// Without `std` the same slot is a `pthread_key_t`, which is what
+/// `thread_local!` lowers to for a type with a destructor anyway. This one has
+/// none, so `std` gets it at a register offset and this does not. See
+/// `src/tls.rs` for what that costs and what would fix it.
+#[cfg(not(feature = "std"))]
+static PIN_MASK: crate::tls::Tls<Cell<u8>> = crate::tls::Tls::new();
+
+/// Run `f` against this thread's pin mask.
+///
+/// Panics during thread teardown, which is what `thread_local!`'s `with` does,
+/// and is unreachable here: a `Guard` is `!Send` and cannot outlive the thread
+/// that made it.
+#[cfg(feature = "std")]
+#[inline]
+fn with_pin_mask<R>(f: impl FnOnce(&Cell<u8>) -> R) -> R {
+    PIN_MASK.with(f)
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn with_pin_mask<R>(f: impl FnOnce(&Cell<u8>) -> R) -> R {
+    PIN_MASK
+        .with(|| Cell::new(0), f)
+        .expect("thread-local storage is gone during teardown")
 }
 const _: () = assert!(PINS_PER_THREAD <= u8::BITS as usize);
 
@@ -44,9 +74,9 @@ impl Default for Domain {
     }
 }
 
-impl std::fmt::Debug for Domain {
+impl core::fmt::Debug for Domain {
     /// Shallow: the garbage list holds closures, which do not print.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Domain")
             .field("id", &self.id)
             .field("epoch", &self.epoch.load(Ordering::Relaxed))
@@ -99,7 +129,7 @@ impl Domain {
         let entry = if crate::registry::is_shared_slot() {
             pin_wildcard(p)
         } else {
-            PIN_MASK.with(|occupied| {
+            with_pin_mask(|occupied| {
                 let mask = occupied.get();
                 if mask == 0 {
                     p.pins[0].store(packed, Ordering::Relaxed);
@@ -134,17 +164,14 @@ impl Domain {
         F: FnOnce() + Send + 'static,
     {
         let e = self.epoch.load(Ordering::Relaxed);
-        self.garbage
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((e, Box::new(f)));
+        crate::sync::lock(&self.garbage).push((e, Box::new(f)));
     }
 
     /// Retirements not yet run.
     ///
     /// The only unbounded thing here: nothing drains without [`Self::advance`].
     pub fn pending(&self) -> usize {
-        self.garbage.lock().unwrap_or_else(|e| e.into_inner()).len()
+        crate::sync::lock(&self.garbage).len()
     }
 
     /// Run every retirement whose grace period has expired, then advance the
@@ -180,12 +207,7 @@ impl Domain {
         // This matters because callers advance far more often than they
         // retire: WorkTable calls it on every mutation of a versioned page,
         // and the common case is that the previous call already drained.
-        if self
-            .garbage
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
-        {
+        if crate::sync::lock(&self.garbage).is_empty() {
             return 0;
         }
 
@@ -216,7 +238,7 @@ impl Domain {
         }
 
         let expired: Vec<Deferred> = {
-            let mut garbage = self.garbage.lock().unwrap_or_else(|e| e.into_inner());
+            let mut garbage = crate::sync::lock(&self.garbage);
             // Strictly less than: something retired in the same epoch a reader
             // pinned in may still be reachable by that reader.
             //
@@ -245,8 +267,7 @@ impl Domain {
 impl Drop for Domain {
     fn drop(&mut self) {
         // Exclusive access, so no reader can be pinned here.
-        let garbage =
-            std::mem::take(&mut *self.garbage.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let garbage = core::mem::take(crate::sync::get_mut(&mut self.garbage));
         for (_, f) in garbage {
             f();
         }
@@ -351,7 +372,7 @@ impl Drop for Guard<'_> {
                 // Release, so a reclaimer that sees the slot free also sees every
                 // access this reader made while pinned.
                 p.pins[entry].store(NO_DOMAIN, Ordering::Release);
-                PIN_MASK.with(|occupied| {
+                with_pin_mask(|occupied| {
                     occupied.set(occupied.get() & !(1_u8 << entry));
                 });
             }

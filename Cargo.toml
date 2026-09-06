@@ -1,12 +1,44 @@
 [package]
 name = "ps-reclaim"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 license = "MIT"
 description = "Per-domain grace-period reclamation for lock-free readers"
 repository = "https://github.com/pathscale/ps-reclaim"
 
 [dependencies]
+
+# `spin` rather than a hand-rolled lock: a spin mutex and a once-cell are the
+# kind of small unsafe primitive that looks obvious and is not, and this crate
+# exists to make reclamation safe. Default features off, so it brings nothing.
+spin = { version = "0.9", default-features = false, features = [
+    "mutex",
+    "spin_mutex",
+    "once",
+], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Only the `no_std` build needs it, for the `pthread_key_t` that stands in for
+# `thread_local!`. The default build has no dependencies at all, as before.
+libc = { version = "0.2", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_System_Threading",
+], optional = true }
+
+[features]
+default = ["std"]
+
+# Off, this crate does not link `std`. It still needs the platform underneath:
+# `thread_local!` becomes a `pthread_key_t` on unix and an `FlsAlloc` slot on
+# Windows, so turning `std` off means turning the platform crate on:
+#
+#     ps-reclaim = { version = "0.1", default-features = false, features = ["libc"] }
+#
+# `Mutex` and `OnceLock` become spins over `core` atomics, which is sound here
+# because neither is on the read path. See `src/sync.rs`.
+std = []
 
 [dev-dependencies]
 # Only to measure against what this replaces. Not a runtime dependency.
