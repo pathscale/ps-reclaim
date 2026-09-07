@@ -215,7 +215,11 @@ fn reclamation_progresses_under_continuous_readers() {
             expected,
             "stalled while readers overlapped"
         );
-        assert_eq!(domain.pending(), 0, "backlog grew during controlled traffic");
+        assert_eq!(
+            domain.pending(),
+            0,
+            "backlog grew during controlled traffic"
+        );
     }
     first.unpin();
     domain.advance();

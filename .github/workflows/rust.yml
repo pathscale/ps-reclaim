@@ -19,9 +19,6 @@ permissions:
 # something, not to every push.
 jobs:
   build:
-    # Source-only follow-up: remove only after authorization to compile.
-    # Skipped checks are not successful validation.
-    if: github.head_ref != 'fix/reclaim-review'
     name: Build and test
     runs-on: ubicloud-standard-2
     timeout-minutes: 15
@@ -40,7 +37,6 @@ jobs:
         run: cargo test --verbose
 
   lint:
-    if: github.head_ref != 'fix/reclaim-review'
     name: Format and clippy
     runs-on: ubicloud-standard-2
     timeout-minutes: 15
