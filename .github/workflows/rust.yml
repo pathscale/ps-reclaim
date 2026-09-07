@@ -54,7 +54,8 @@ jobs:
   miri:
     name: Miri
     runs-on: ubicloud-standard-2
-    timeout-minutes: 30
+    # Two passes now, and `concurrency` alone took 597s in the last run.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -64,10 +65,32 @@ jobs:
         with:
           cache-on-failure: "true"
           add-job-id-key: "false"
-      - name: Miri (strict provenance)
+      # Two passes, because one test has to leak and the rest must not.
+      #
+      # `tests/tls_teardown.rs` needs a `&'static Domain` that outlives
+      # thread-local destructors, which only `Box::leak` gives it. That is a
+      # fixture leak, not a crate leak, and Miri's exit-time check cannot tell
+      # the difference. Turning leak checking off globally to accommodate it
+      # would throw away the signal that matters most here: this crate hands out
+      # registry slots and a leaked one is a real defect.
+      #
+      # So the suite keeps strict leak checking with that test excluded, and the
+      # test runs on its own with leaks ignored. Undefined behaviour is still
+      # checked in both, which is the part worth having on a teardown path.
+      - name: Miri (strict provenance, leak-checked)
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
-        run: cargo miri test
+        run: |
+          cargo miri test --lib \
+            --test concurrency \
+            --test contract \
+            --test handle_overflow \
+            --test handles \
+            --test overflow_slots
+      - name: Miri (teardown fixture, leaks ignored)
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-ignore-leaks
+        run: cargo miri test --test tls_teardown
 
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
