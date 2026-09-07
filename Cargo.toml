@@ -45,6 +45,13 @@ std = []
 # this feature: a thread-local cache cannot safely borrow a per-fiber lease.
 nightly = []
 
+# Read the thread-local slot with inline asm instead of calling
+# `pthread_getspecific`. Same key, same slot, same destructor: only the read is
+# inlined, which is what lets the optimiser move it. Off by default because the
+# TSD layout it depends on is an undocumented ABI. aarch64 macOS only; every
+# other target keeps the call.
+inline-tsd = []
+
 # Experimental isolation control: with std, change only the garbage-list
 # mutex, leaving TLS and the registry allocator unchanged. Not a speed claim.
 spin-garbage = ["spin"]
