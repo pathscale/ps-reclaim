@@ -102,7 +102,15 @@ impl Domain {
     /// After registration, a normal pin uses a thread-local read, a relaxed
     /// epoch load, a store to its own padded slot, and a fence. Overflow pins
     /// instead increment a wildcard counter, shared on registry overflow.
-    #[inline]
+    //  is worth 33% at the application level and nothing in a
+    // microbenchmark, which is why it took a full-stack A/B to find.
+    //
+    // Folding the three thread-locals into one put the whole pin body inline at
+    // every call site. Arctic calls this inside a radix-tree walk, so the bloat
+    // lands in the hot loop: wt-benchmarks arctic_concurrent went 52.1 to 69.5
+    // ns per lookup at 8192 keys. Outlining it restores 52.1 exactly. A pin
+    // measured on its own sees none of this, and said the fold made it faster.
+    #[inline(never)]
     pub fn pin(&self) -> Guard<'_> {
         // One thread-local lookup for the whole pin. The participant, the
         // shared-slot flag and the pin mask are fields of one `Local`.
