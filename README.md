@@ -11,17 +11,33 @@ when that is safe.
 Three guarantees, one test each in `tests/contract.rs`:
 
 1. A retirement does not run while a reader that predates it is live.
-2. **A reader that starts after a retirement does not delay it.** Under
-   continuous read traffic there may never be an instant with zero readers, and
-   a scheme that waits for one never reclaims at all.
-3. Reclamation only happens in `advance()`. A read never pays for garbage.
+2. Readers in strictly later epochs do not delay older retirements. Same-epoch
+   readers can delay them, even if they started after retirement. Wildcard pins
+   delay every domain. At 40-bit epoch saturation, new retirements require a scan
+   without matching pins. Monitor `epoch_headroom()` and arrange exclusive
+   maintenance with `renew_epoch()` before saturation.
+3. Reclamation is driven by `advance()` / `advance_up_to()` and by domain
+   destruction. Read-side unpin never invokes retirement callbacks.
 
-Guarantee 2 is why this exists. `seize` and a plain global reader counter do
-not provide it.
+Unlike a plain global reader counter, normal operation can reclaim while readers
+overlap continuously. This statement is not a comparative result for other
+reclamation libraries. Epoch renewal is not transparent rollover: it requires
+`&mut Domain`, excluding active guards and concurrent operations. At one million
+epoch-incrementing scans per second, a fresh domain has about 12.7 days of
+headroom. Callback order is unspecified; cleanup should not
+panic. See `Domain::retire` for unwind behavior.
+
+`advance_up_to` bounds callbacks, not total scan time, allocator work, lock wait,
+or callback duration. Retire/advance are not lock-free writer operations.
+Exclusive registrations abandoned with outstanding guards are quarantined until
+those guards drop, then recovered on a subsequent cold registration path.
+Truly forgotten guards continue to consume capacity. Use `registry_stats()` for
+cold-path capacity diagnostics, not allocation-leak reports.
 
 ## Cost
 
-Pin cost, M4 Max, `cargo bench --bench pin`, ns/op:
+Historical pin cost, M4 Max, old `cargo bench --bench pin`, ns/op. These are not
+measurements of this source-only follow-up or an HFT latency guarantee:
 
 | readers | ps-reclaim | crossbeam-epoch | seize |
 | --- | --- | --- | --- |
@@ -31,8 +47,7 @@ Pin cost, M4 Max, `cargo bench --bench pin`, ns/op:
 | 8 | **1.45** | 9.00 | 2.39 |
 | degradation | 1.02x | 4.7x | 1.04x |
 
-`crossbeam-epoch` runs a global collect every 128 pins, and that walk grows
-with the reader count, so its read path is not flat. `seize` is flat and
-cheapest but fails guarantee 2. This is flat and keeps guarantee 2.
-
-Read the numbers before changing anything here.
+The old harness did not establish simultaneous worker readiness and included
+first registration. Its comparison also includes each library's adapter costs.
+Do not infer scalability or causal explanations from this table alone. See
+[measurement limits](docs/tls-cost.md) and the [PR #9 source notes](docs/review-pr9.md).

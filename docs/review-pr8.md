@@ -1,5 +1,10 @@
 # Source-only follow-up to PR #7
 
+Historical record of PR #8, not the current implementation or CI status.
+PR #7 subsequently incorporated and validated that work. The new source-only
+follow-up is described in [review-pr9.md](review-pr9.md); its queue, epoch,
+quarantine, test and CI changes supersede the corresponding notes below.
+
 This branch is stacked on `perf/handle-api`, including its updated head
 `460688aced65a407412382654b7007cdc6c1aa73`. It is best-effort source, not
 validated HFT software. No compilation, formatter, tests, benchmarks, Miri or

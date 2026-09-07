@@ -5,20 +5,22 @@
 //! other half: a domain is only useful if it is still correct when readers and
 //! reclaimers run at once, and none of that is observable from one thread.
 //!
-//! Every test here was checked to fail against a deliberately broken domain
-//! before being trusted. Where the break is easy to describe, the test says
-//! what it was, because a concurrency test whose failure mode nobody has seen
-//! is decoration.
+//! New and changed tests in the PR #9 follow-up are source-only and have not
+//! been executed or mutation-validated. Native/Miri runs sample executions;
+//! they do not exhaust the weak-memory protocol. See loom_protocol.rs too.
 //!
 //! Run these under Miri as well as natively. A racy pointer-sized load is
 //! atomic in practice on aarch64, so a native pass proves much less here than
 //! it looks: `MIRIFLAGS="-Zmiri-strict-provenance" cargo +nightly miri test`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use ps_reclaim::Domain;
+use ps_reclaim::{Domain, Handle};
+
+mod support;
+use support::RemoteReader;
 
 /// A slot acquired *after* a scan begins is still protected.
 ///
@@ -110,118 +112,114 @@ fn a_slot_leased_during_a_scan_is_still_protected() {
 /// inside its own guard is a use-after-free that happened to be survivable.
 #[test]
 fn a_reader_never_observes_a_reclaimed_payload() {
+    atomic_publication(false);
+}
+
+#[test]
+fn an_explicit_reader_never_observes_a_reclaimed_payload() {
+    atomic_publication(true);
+}
+
+fn atomic_publication(explicit: bool) {
     const SENTINEL: usize = 0x5AFE_5AFE;
     const POISON: usize = 0xDEAD_DEAD;
-
-    let domain = Arc::new(Domain::new());
-    let published: Arc<std::sync::Mutex<Arc<AtomicUsize>>> =
-        Arc::new(std::sync::Mutex::new(Arc::new(AtomicUsize::new(SENTINEL))));
-    let stop = Arc::new(AtomicBool::new(false));
-    let observed_poison = Arc::new(AtomicBool::new(false));
-
-    let readers: Vec<_> = (0..4)
-        .map(|_| {
-            let (domain, published, stop, observed_poison) = (
-                Arc::clone(&domain),
-                Arc::clone(&published),
-                Arc::clone(&stop),
-                Arc::clone(&observed_poison),
-            );
-            thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let guard = domain.pin();
-                    // Take the payload that is current *at pin time*. Anything
-                    // retired after this must not run until the guard drops.
-                    let mine = Arc::clone(&published.lock().expect("not poisoned"));
-                    for _ in 0..16 {
-                        if mine.load(Ordering::Acquire) == POISON {
-                            observed_poison.store(true, Ordering::SeqCst);
+    const UPDATES: usize = if cfg!(miri) { 32 } else { 2_000 };
+    let domain = Domain::new();
+    // Keep storage alive through joining, so broken reclamation yields an
+    // assertion rather than deliberately executing a dangling dereference.
+    // The deferred poison, not Arc ownership, tests the grace period.
+    let payloads: Arc<[AtomicUsize]> = (0..=UPDATES)
+        .map(|_| AtomicUsize::new(SENTINEL))
+        .collect::<Vec<_>>()
+        .into();
+    let published = AtomicPtr::new(&payloads[0] as *const AtomicUsize as *mut AtomicUsize);
+    let start = Barrier::new(6); // four readers, second reclaimer, writer
+    thread::scope(|scope| {
+        for _ in 0..4 {
+            let (domain, published, start) = (&domain, &published, &start);
+            scope.spawn(move || {
+                start.wait();
+                let handle = if explicit { Some(Handle::new()) } else { None };
+                for _ in 0..UPDATES {
+                    let read = || {
+                        let mine = published.load(Ordering::Acquire);
+                        // SAFETY: root always names an element in payloads,
+                        // whose allocation remains live until the scope joins.
+                        let mine = unsafe { &*mine };
+                        for _ in 0..4 {
+                            assert_ne!(mine.load(Ordering::Acquire), POISON);
+                            std::hint::spin_loop();
                         }
-                        std::hint::spin_loop();
+                    };
+                    if let Some(handle) = &handle {
+                        let guard = domain.pin_with(handle);
+                        read();
+                        drop(guard);
+                    } else {
+                        let guard = domain.pin();
+                        read();
+                        drop(guard);
                     }
-                    drop(guard);
                 }
-            })
-        })
-        .collect();
-
-    for _ in 0..2_000 {
-        let old = {
-            let mut slot = published.lock().expect("not poisoned");
-            let old = Arc::clone(&*slot);
-            *slot = Arc::new(AtomicUsize::new(SENTINEL));
-            old
-        };
-        // Retiring the poison is the stand-in for freeing `old`. If it runs
-        // while a reader that pinned before this call still holds `old`, that
-        // reader sees POISON.
-        domain.retire(move || old.store(POISON, Ordering::Release));
-        domain.advance();
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    for r in readers {
-        r.join().expect("reader did not panic");
-    }
-    assert!(
-        !observed_poison.load(Ordering::SeqCst),
-        "a reader inside its guard observed a payload that had been reclaimed"
-    );
+            });
+        }
+        let (scanning, ready) = (&domain, &start);
+        scope.spawn(move || {
+            ready.wait();
+            for _ in 0..UPDATES * 2 {
+                scanning.advance_up_to(8);
+                thread::yield_now();
+            }
+        });
+        start.wait();
+        for index in 0..UPDATES {
+            let guard = domain.pin();
+            let next = &payloads[index + 1] as *const AtomicUsize as *mut AtomicUsize;
+            let old = published.swap(next, Ordering::AcqRel);
+            assert!(core::ptr::eq(old, &payloads[index]));
+            let retired = Arc::clone(&payloads);
+            domain.retire(move || retired[index].store(POISON, Ordering::Release));
+            drop(guard);
+            domain.advance_up_to(8);
+        }
+    });
+    domain.advance();
+    assert_eq!(domain.pending(), 0);
 }
 
 /// Reclamation keeps making progress while readers keep arriving.
 ///
-/// The property that rules out `seize` for this workload: a scheme that waits
-/// for a moment when nobody is pinned never reaches one under continuous read
-/// traffic, and its backlog grows without bound. This asserts the backlog stays
-/// *bounded*, not zero: a retirement raced by a reader that pinned just before
-/// it legitimately waits for that reader.
+/// Every handover preserves overlap. Assert progress BEFORE releasing the last
+/// reader, not after stopping traffic and allowing a quiescent cleanup pass.
 #[test]
 fn reclamation_progresses_under_continuous_readers() {
     let domain = Arc::new(Domain::new());
-    let stop = Arc::new(AtomicBool::new(false));
     let ran = Arc::new(AtomicUsize::new(0));
-
-    let readers: Vec<_> = (0..4)
-        .map(|_| {
-            let (domain, stop) = (Arc::clone(&domain), Arc::clone(&stop));
-            thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let guard = domain.pin();
-                    std::hint::black_box(&guard);
-                    drop(guard);
-                }
-            })
-        })
-        .collect();
-
-    const RETIREMENTS: usize = 5_000;
-    for _ in 0..RETIREMENTS {
-        let ran = Arc::clone(&ran);
+    let first = RemoteReader::spawn(Arc::clone(&domain));
+    let second = RemoteReader::spawn(Arc::clone(&domain));
+    first.pin();
+    const RETIREMENTS: usize = if cfg!(miri) { 16 } else { 256 };
+    for expected in 1..=RETIREMENTS {
+        let counter = Arc::clone(&ran);
         domain.retire(move || {
-            ran.fetch_add(1, Ordering::Release);
+            counter.fetch_add(1, Ordering::Release);
         });
+        second.pin();
+        first.unpin();
         domain.advance();
-    }
-
-    stop.store(true, Ordering::Relaxed);
-    for r in readers {
-        r.join().expect("reader did not panic");
-    }
-    for _ in 0..8 {
+        first.pin(); // strictly later epoch; second still holds its old pin
+        second.unpin();
         domain.advance();
+        assert_eq!(
+            ran.load(Ordering::Acquire),
+            expected,
+            "stalled while readers overlapped"
+        );
+        assert_eq!(domain.pending(), 0, "backlog grew during controlled traffic");
     }
-
-    let done = ran.load(Ordering::Acquire);
-    assert!(
-        done >= RETIREMENTS / 2,
-        "reclamation stalled under continuous readers: {done} of {RETIREMENTS} ran"
-    );
-    assert!(
-        domain.pending() < RETIREMENTS / 2,
-        "backlog grew without bound: {} still queued",
-        domain.pending()
-    );
+    first.unpin();
+    domain.advance();
+    assert_eq!(ran.load(Ordering::Acquire), RETIREMENTS);
 }
 
 /// More live threads than a thread has pin slots.

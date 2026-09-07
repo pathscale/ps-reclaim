@@ -34,7 +34,7 @@ default = ["std"]
 # `thread_local!` becomes a `pthread_key_t` on unix and an `FlsAlloc` slot on
 # Windows, so turning `std` off means turning the platform crate on:
 #
-#     ps-reclaim = { version = "0.1", default-features = false, features = ["libc"] }
+#     ps-reclaim = { version = "0.1", default-features = false, features = ["libc", "spin"] }
 #
 # `Mutex` and `OnceLock` become spins over `core` atomics. Neither is on the
 # steady-state read path; writer tail latency still needs measurement.
@@ -64,9 +64,9 @@ criterion = "0.5"
 # `getrusage` in `benches/burst.rs`: wall clock cannot see a burnt core.
 libc = "0.2"
 
-# Only when `--cfg ps_loom` is set, so an ordinary build never fetches it.
+# Built only when `--cfg ps_loom` is set; Cargo may still resolve its metadata.
 #
-#     RUSTFLAGS="--cfg ps_loom" cargo test --release --test loom_model
+#     RUSTFLAGS="--cfg ps_loom" cargo test --test loom_model --test loom_protocol
 #
 # Manual, like Miri: exhaustive interleaving exploration is not something to put
 # on every push.
