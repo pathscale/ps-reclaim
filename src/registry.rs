@@ -51,8 +51,23 @@ pub(crate) struct Registry {
     pub(crate) slots: Vec<Participant>,
     /// Indices handed back by exited threads, reused rather than growing
     /// without bound in a program that spawns many short-lived threads.
-    free: Mutex<Vec<usize>>,
+    returned: Mutex<Returned>,
     next: AtomicUsize,
+}
+
+#[derive(Default)]
+struct Returned {
+    free: Vec<usize>,
+    /// Ownership ended before the last pin did. Registration (a cold path)
+    /// recovers an index once all of its pins are gone. Guard drop stays cheap.
+    quarantined: Vec<usize>,
+}
+
+fn idle(p: &Participant) -> bool {
+    p.wildcard.load(Ordering::Acquire) == 0
+        && p.pins
+            .iter()
+            .all(|pin| pin.load(Ordering::Acquire) == NO_DOMAIN)
 }
 
 impl Registry {
@@ -60,7 +75,7 @@ impl Registry {
         static REGISTRY: crate::sync::OnceLock<Registry> = crate::sync::OnceLock::new();
         crate::sync::get_or_init(&REGISTRY, || Registry {
             slots: (0..MAX_THREADS).map(|_| Participant::new()).collect(),
-            free: Mutex::new(Vec::new()),
+            returned: Mutex::new(Returned::default()),
             next: AtomicUsize::new(0),
         })
     }
@@ -77,14 +92,26 @@ impl Registry {
     /// So the overflow slot is reported, and callers put those threads on the
     /// wildcard instead, which *is* a counter and therefore composes.
     pub(crate) fn acquire(&self) -> (usize, bool) {
-        if let Some(idx) = crate::sync::lock(&self.free).pop() {
+        let mut returned = crate::sync::lock(&self.returned);
+        if let Some(idx) = returned.free.pop() {
             return (idx, false);
         }
+        if let Some(position) = returned
+            .quarantined
+            .iter()
+            .position(|&idx| idle(&self.slots[idx]))
+        {
+            return (returned.quarantined.swap_remove(position), false);
+        }
+        drop(returned);
         // Keep the diagnostic counter monotonic even on long-lived 32-bit
         // targets. Wrapping could hand out an exclusive slot still in use.
-        let idx = self.next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        }).unwrap_or(usize::MAX);
+        let idx = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or(usize::MAX);
         if idx < MAX_THREADS - 1 {
             (idx, false)
         } else {
@@ -104,14 +131,15 @@ impl Registry {
         let p = &self.slots[idx];
         // A guard may outlive the TLS lease in another TLS destructor, or be
         // forgotten through safe code. Never erase such a pin to recycle its
-        // slot. Leaking the registration in this exceptional case is safer
-        // than permitting a new owner to overwrite a still-live reader.
-        if p.wildcard.load(Ordering::Acquire) != 0
-            || p.pins.iter().any(|pin| pin.load(Ordering::Acquire) != NO_DOMAIN)
-        {
-            return;
+        // slot. Quarantine it until a cold registration path observes every
+        // old pin released. A truly forgotten guard keeps its slot quarantined.
+        // No owner can publish new pins after relinquishing this lease.
+        let mut returned = crate::sync::lock(&self.returned);
+        if idle(p) {
+            returned.free.push(idx);
+        } else {
+            returned.quarantined.push(idx);
         }
-        crate::sync::lock(&self.free).push(idx);
     }
 }
 
@@ -202,7 +230,10 @@ struct OwnedLocal {
 #[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 impl OwnedLocal {
     fn new() -> Self {
-        Self { local: Local::new(), lease: RefCell::new(None) }
+        Self {
+            local: Local::new(),
+            lease: RefCell::new(None),
+        }
     }
 }
 
@@ -250,18 +281,27 @@ pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
 #[cfg(feature = "std")]
 #[inline]
 fn install_lease(lease: SlotLease) -> bool {
-    LEASE.try_with(|l| *l.borrow_mut() = Some(ThreadLease { _lease: lease })).is_ok()
+    LEASE
+        .try_with(|l| *l.borrow_mut() = Some(ThreadLease { _lease: lease }))
+        .is_ok()
 }
 
 #[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[inline]
 fn install_lease(lease: SlotLease) -> bool {
-    LEASE.with(|| RefCell::new(None), |l| *l.borrow_mut() = Some(ThreadLease { _lease: lease })).is_some()
+    LEASE
+        .with(
+            || RefCell::new(None),
+            |l| *l.borrow_mut() = Some(ThreadLease { _lease: lease }),
+        )
+        .is_some()
 }
 
 #[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 fn install_lease(lease: SlotLease) -> bool {
-    LOCAL.get(|owned| *owned.lease.borrow_mut() = Some(lease)).is_some()
+    LOCAL
+        .get(|owned| *owned.lease.borrow_mut() = Some(lease))
+        .is_some()
 }
 
 /// Access only an existing Local. Guard destruction must not initialize a new
@@ -303,12 +343,18 @@ pub(crate) fn participant_in(local: &Local) -> &'static Participant {
 #[cold]
 #[inline(never)]
 fn register(local: &Local) -> &'static Participant {
-    assert!(!local.closed.get(), "cannot pin after registration teardown");
+    assert!(
+        !local.closed.get(),
+        "cannot pin after registration teardown"
+    );
     let registry = Registry::get();
     let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];
     // Install ownership before publishing a cache that readers can use.
-    assert!(install_lease(SlotLease(idx, shared)), "cannot install registration during teardown");
+    assert!(
+        install_lease(SlotLease(idx, shared)),
+        "cannot install registration during teardown"
+    );
     local.mine.set(Some(p));
     local.shared.set(shared);
     p
@@ -326,6 +372,41 @@ fn register(local: &Local) -> &'static Participant {
 /// It was called `slots_in_use`, which said the opposite of what it returns.
 pub fn slots_handed_out() -> usize {
     Registry::get().next.load(Ordering::Relaxed)
+}
+
+/// Cold-path registration capacity snapshot, not a reader-hot-path operation.
+/// Fields describing pins can change immediately after this snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegistryStats {
+    /// Exclusive slots whose owners have relinquished them with outstanding pins.
+    /// Includes slots whose last pin has since dropped but have not been reused.
+    pub quarantined: usize,
+    /// Quarantined slots still observed to have at least one outstanding pin.
+    pub pinned_quarantined: usize,
+    /// Free, never-issued, or quiescent quarantined exclusive slots available
+    /// for reuse when this snapshot was taken. Concurrent acquisition can race.
+    pub available_exclusive: usize,
+}
+
+/// Inspect registration capacity without resetting or erasing any live pin.
+/// Takes the registry allocator lock and scans quarantined slots. Logical slot
+/// loss is not an allocation leak that Miri's exit-time leak checker detects.
+pub fn registry_stats() -> RegistryStats {
+    let registry = Registry::get();
+    let returned = crate::sync::lock(&registry.returned);
+    let quarantined = returned.quarantined.len();
+    let pinned_quarantined = returned
+        .quarantined
+        .iter()
+        .filter(|&&idx| !idle(&registry.slots[idx]))
+        .count();
+    let issued = registry.next.load(Ordering::Relaxed).min(MAX_THREADS - 1);
+    RegistryStats {
+        quarantined,
+        pinned_quarantined,
+        available_exclusive: MAX_THREADS - 1 - issued + returned.free.len() + quarantined
+            - pinned_quarantined,
+    }
 }
 
 impl Registry {
@@ -358,12 +439,45 @@ mod tests {
     fn saturated_registration_counter_never_reissues_an_exclusive_slot() {
         let registry = Registry {
             slots: (0..MAX_THREADS).map(|_| Participant::new()).collect(),
-            free: Mutex::new(Vec::new()),
+            returned: Mutex::new(Returned::default()),
             next: AtomicUsize::new(usize::MAX),
         };
         for _ in 0..3 {
             assert_eq!(registry.acquire(), (MAX_THREADS - 1, true));
         }
         assert_eq!(registry.next.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn quarantined_slot_is_recovered_only_after_every_old_pin_drops() {
+        let registry = Registry {
+            slots: (0..MAX_THREADS).map(|_| Participant::new()).collect(),
+            returned: Mutex::new(Returned::default()),
+            next: AtomicUsize::new(0),
+        };
+        for _ in 0..MAX_THREADS * 2 {
+            let (idx, shared) = registry.acquire();
+            assert_eq!((idx, shared), (0, false));
+            let p = &registry.slots[idx];
+            p.pins[0].store(1, Ordering::Relaxed);
+            p.wildcard.store(1, Ordering::Relaxed);
+            registry.release(idx, shared);
+            assert_eq!(crate::sync::lock(&registry.returned).quarantined, [0]);
+            p.pins[0].store(NO_DOMAIN, Ordering::Release);
+            assert!(!idle(p), "wildcard still owns the abandoned registration");
+            let (other, shared) = registry.acquire();
+            assert_ne!(other, idx, "reissued a still-pinned slot");
+            p.wildcard.store(0, Ordering::Release);
+            // Keep `other` leased while recovering the quarantined slot: a free
+            // slot would legitimately be preferred over the quarantine scan.
+            assert_eq!(registry.acquire(), (idx, false));
+            registry.release(idx, false);
+            registry.release(other, shared);
+            // Discard this test's free-list ordering, not any outstanding pins.
+            let mut returned = crate::sync::lock(&registry.returned);
+            assert!(returned.quarantined.is_empty());
+            returned.free.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        assert_eq!(registry.next.load(Ordering::Relaxed), 2);
     }
 }
