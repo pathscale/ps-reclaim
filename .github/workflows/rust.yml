@@ -33,6 +33,42 @@ jobs:
       - name: Run doctests
         run: cargo test --doc --verbose
 
+  # Everything above runs one configuration: default features, on Linux. That
+  # left four production configurations with no CI at all, which a review caught
+  # rather than a build failure. These are the ones consumers actually select.
+  #
+  # `inline-tsd` is here on purpose even though its fast path is aarch64 macOS
+  # only: on any other target it must fall back to the libc call and keep
+  # building, and this is what proves it.
+  features:
+    name: Feature matrix
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no_std, platform keys
+            args: --no-default-features --features libc,spin
+          - name: no_std, spin garbage
+            args: --no-default-features --features libc,spin,spin-garbage
+          - name: std, spin garbage
+            args: --features spin-garbage
+          - name: no_std, inline-tsd fallback
+            args: --no-default-features --features libc,spin,inline-tsd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          add-job-id-key: "false"
+      - name: Build (${{ matrix.name }})
+        run: cargo build --all-targets --verbose ${{ matrix.args }}
+      - name: Test (${{ matrix.name }})
+        run: cargo test --all-targets --verbose ${{ matrix.args }}
+      - name: Clippy (${{ matrix.name }})
+        run: cargo clippy --all-targets ${{ matrix.args }} -- -D warnings
+
   lint:
     name: Format and clippy
     runs-on: ubicloud-standard-2
