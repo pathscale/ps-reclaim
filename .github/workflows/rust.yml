@@ -15,9 +15,6 @@ permissions:
 
 jobs:
   build:
-    # This stacked review was explicitly requested as source-only. Keep its
-    # draft from compiling; normal PRs and a later ready-for-review run retain CI.
-    if: github.head_ref != 'fix/reclaim-review' || github.event.pull_request.draft != true
     name: Build and test
     runs-on: ubicloud-standard-2
     timeout-minutes: 15
@@ -37,7 +34,6 @@ jobs:
         run: cargo test --doc --verbose
 
   lint:
-    if: github.head_ref != 'fix/reclaim-review' || github.event.pull_request.draft != true
     name: Format and clippy
     runs-on: ubicloud-standard-2
     timeout-minutes: 15
@@ -56,7 +52,6 @@ jobs:
   # rests on. Miri can, and strict provenance is what rejects the integer round
   # trip the packed guard was first written with.
   miri:
-    if: github.head_ref != 'fix/reclaim-review' || github.event.pull_request.draft != true
     name: Miri
     runs-on: ubicloud-standard-2
     timeout-minutes: 30

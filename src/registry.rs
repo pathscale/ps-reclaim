@@ -320,7 +320,10 @@ pub(crate) fn participant_in(local: &Local) -> &'static Participant {
 #[cold]
 #[inline(never)]
 fn register(local: &Local) -> &'static Participant {
-    assert!(!local.closed.get(), "cannot pin after registration teardown");
+    assert!(
+        !local.closed.get(),
+        "cannot pin after registration teardown"
+    );
     let registry = Registry::get();
     let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];

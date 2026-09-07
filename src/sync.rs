@@ -23,10 +23,10 @@ pub(crate) use std::sync::{Mutex, OnceLock};
 #[cfg(not(feature = "std"))]
 pub(crate) use spin::{Mutex, Once as OnceLock};
 
-#[cfg(all(feature = "std", not(feature = "spin-garbage")))]
-pub(crate) use std::sync::Mutex as GarbageMutex;
 #[cfg(any(not(feature = "std"), feature = "spin-garbage"))]
 pub(crate) use spin::Mutex as GarbageMutex;
+#[cfg(all(feature = "std", not(feature = "spin-garbage")))]
+pub(crate) use std::sync::Mutex as GarbageMutex;
 
 #[cfg(all(feature = "std", not(feature = "spin-garbage")))]
 #[inline]

@@ -12,8 +12,8 @@
 //! Final quiescent garbage draining is checked but outside the timed window.
 
 use std::hint::black_box;
-use std::sync::{Arc, Barrier, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 use ps_reclaim::{Domain, Handle};
@@ -28,9 +28,14 @@ const RETIRE_EVERY: usize = 64;
 const WARMUP_ROUNDS: usize = 6;
 const ROUNDS: usize = 24;
 const ORDERS: [[usize; 3]; 6] = [
-    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
 ];
-const _: () = assert!(UPDATES % WRITERS == 0);
+const _: () = assert!(UPDATES.is_multiple_of(WRITERS));
 
 #[cfg(unix)]
 fn cpu() -> Option<Duration> {
@@ -40,14 +45,14 @@ fn cpu() -> Option<Duration> {
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
         return None;
     }
-    let part = |t: libc::timeval| {
-        Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1_000)
-    };
+    let part = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1_000);
     Some(part(usage.ru_utime) + part(usage.ru_stime))
 }
 
 #[cfg(not(unix))]
-fn cpu() -> Option<Duration> { None }
+fn cpu() -> Option<Duration> {
+    None
+}
 
 struct WriterJob {
     explicit: bool,
@@ -104,7 +109,9 @@ fn run(think: u32) -> [Measurements; 3] {
                             black_box(&guard);
                         }
                         count += 1;
-                        for _ in 0..think { core::hint::spin_loop(); }
+                        for _ in 0..think {
+                            core::hint::spin_loop();
+                        }
                     }
                     black_box(acc);
                     report.send(count).unwrap();
@@ -153,7 +160,12 @@ fn run(think: u32) -> [Measurements; 3] {
                         job.samples.push(at.elapsed());
                     }
                     let finished = Instant::now();
-                    report.send(WriterReport { finished, samples: job.samples }).unwrap();
+                    report
+                        .send(WriterReport {
+                            finished,
+                            samples: job.samples,
+                        })
+                        .unwrap();
                 }
             });
             writers.push((jobs, reports, Vec::with_capacity(PER_WRITER)));
@@ -163,11 +175,15 @@ fn run(think: u32) -> [Measurements; 3] {
         for round in 0..WARMUP_ROUNDS + ROUNDS {
             for arm in ORDERS[round % ORDERS.len()] {
                 stop.store(false, Ordering::Relaxed);
-                for (jobs, _) in &readers { jobs.send(arm == 1).unwrap(); }
+                for (jobs, _) in &readers {
+                    jobs.send(arm == 1).unwrap();
+                }
                 for (jobs, _, samples) in &mut writers {
                     jobs.send(WriterJob {
-                        explicit: arm == 1, samples: core::mem::take(samples),
-                    }).unwrap();
+                        explicit: arm == 1,
+                        samples: core::mem::take(samples),
+                    })
+                    .unwrap();
                 }
                 ready.wait();
                 let before_cpu = cpu();
@@ -180,7 +196,10 @@ fn run(think: u32) -> [Measurements; 3] {
                     *samples = report.samples;
                 }
                 stop.store(true, Ordering::Relaxed);
-                let reads: u64 = readers.iter().map(|(_, report)| report.recv().unwrap()).sum();
+                let reads: u64 = readers
+                    .iter()
+                    .map(|(_, report)| report.recv().unwrap())
+                    .sum();
                 // CPU covers release through reader shutdown, not just the
                 // drain. Capture before aggregation and quiescent reclamation.
                 let used_cpu = before_cpu.zip(cpu()).map(|(a, b)| b.saturating_sub(a));
@@ -192,7 +211,9 @@ fn run(think: u32) -> [Measurements; 3] {
                 if round >= WARMUP_ROUNDS {
                     let result = &mut results[arm];
                     result.drains.push(finished.duration_since(started));
-                    if let Some(cpu) = used_cpu { result.cpus.push(cpu); }
+                    if let Some(cpu) = used_cpu {
+                        result.cpus.push(cpu);
+                    }
                     result.reads.push(reads);
                     for (_, _, samples) in &writers {
                         result.latencies.extend_from_slice(samples);
@@ -215,13 +236,17 @@ fn percentile(sorted: &[Duration], per_mille: usize) -> Duration {
 
 fn main() {
     println!("{UPDATES} updates/burst; {WRITERS} persistent writers, {READERS} readers");
-    println!("{WARMUP_ROUNDS} warmup + {ROUNDS} measured rounds; counterbalanced TLS/handle/TLS control");
+    println!(
+        "{WARMUP_ROUNDS} warmup + {ROUNDS} measured rounds; counterbalanced TLS/handle/TLS control"
+    );
     println!("60 retirements/burst; advance_up_to(8) after each retirement; final drain excluded");
     println!("CPU: release through reader shutdown; drain: release through last writer timestamp");
     println!("No affinity control; sampled update times include clocks and periodic reclamation.");
     for think in [0u32, 100, 1_000, 10_000] {
         println!("\nreader think: {think} spin_loop iterations");
-        println!("arm             Mupdates/s  drain us  CPU ms  reads/burst   p50 ns   p99 ns p99.9 ns   max ns");
+        println!(
+            "arm             Mupdates/s  drain us  CPU ms  reads/burst   p50 ns   p99 ns p99.9 ns   max ns"
+        );
         for (name, mut result) in ["TLS", "handle", "TLS control"].into_iter().zip(run(think)) {
             result.drains.sort_unstable();
             result.cpus.sort_unstable();
@@ -233,14 +258,16 @@ fn main() {
             } else {
                 format!("{:.3}", percentile(&result.cpus, 500).as_secs_f64() * 1e3)
             };
-            println!("{name:<15} {:>10.3} {:>9.3} {cpu:>7} {:>12} {:>8} {:>8} {:>8} {:>8}",
+            println!(
+                "{name:<15} {:>10.3} {:>9.3} {cpu:>7} {:>12} {:>8} {:>8} {:>8} {:>8}",
                 UPDATES as f64 / drain.as_secs_f64() / 1e6,
                 drain.as_secs_f64() * 1e6,
                 result.reads[result.reads.len() / 2],
                 percentile(&result.latencies, 500).as_nanos(),
                 percentile(&result.latencies, 990).as_nanos(),
                 percentile(&result.latencies, 999).as_nanos(),
-                result.latencies.last().unwrap().as_nanos());
+                result.latencies.last().unwrap().as_nanos()
+            );
         }
     }
 }

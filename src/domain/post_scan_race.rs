@@ -92,7 +92,8 @@ fn post_scan_retirement_must_not_destroy_a_pinned_object() {
         "payload must be destroyed exactly once"
     );
     assert_eq!(
-        domain.pending(), 0,
+        domain.pending(),
+        0,
         "quiescent cleanup must drain the queue"
     );
     assert_eq!(
