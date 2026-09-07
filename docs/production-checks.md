@@ -180,3 +180,66 @@ approaches it.
 **A panicking callback drops the rest of its batch** without running them. If
 your retirements are plain deallocation this cannot fire; if they can panic and
 you recover from unwinding, queued cleanup disappears.
+
+## 7. Measuring this crate: what wasted a day
+
+Four traps, each of which produced a confident wrong number before it was caught.
+All four are cheap to avoid and none is obvious from inside a microbenchmark.
+
+**Assert the dependency graph before every arm.** `[patch.crates-io]` declines
+silently when the local version is not semver-compatible with the lockfile pin,
+and `cargo bench` swallows the warning. Two arms were built from the same
+published binary and their difference reported as a 2x improvement. Gate every
+measurement on:
+
+```sh
+cargo tree -e normal -p ps-reclaim   # must print the local path
+```
+
+`wt-benchmarks` gitignores its lockfile, so deleting the stale `ps-reclaim`
+entry is safe and is what makes the patch take.
+
+**A pin microbenchmark cannot see inlining cost.** Folding the thread-locals
+measured 3.5 to 1.78 ns in isolation and was a **33% regression** through
+`wt-benchmarks` (52.1 to 69.5 ns), because it inlined the whole pin body into
+every call site and Arctic calls `pin` inside a radix-tree walk. `inline(never)`
+on `pin` restores parity while making the microbenchmark worse. Layers disagree,
+and the application layer wins.
+
+**Controls tell you the noise floor; run them.** `arctic_concurrent` has a
+`_noop` SMR arm and `micro-layers` has `vec` and `worktable-congee`, none of
+which touch reclamation. On a quiet box those controls still moved 15% and the
+pure-`Vec` `range_scan` moved 15.8%. Anything inside about ±10% on
+`micro-layers`, or ±15-30% on `arctic_concurrent` under load, is not a result.
+A `+21.2%` update_field gain reported from two runs taken minutes apart became
+**-3.0%** when all three arms were run back to back.
+
+**Load is the operating condition, not contamination.** At t8/w20 under twelve
+background threads on sixteen cores: 69.1 / 73.7 / 68.2 ns for master, branch
+and `no_std`. `no_std` did not degrade worse despite using a spin lock on the
+retire path, which was the standing hypothesis. Numbers from an idle machine
+describe a machine nobody deploys on.
+
+### The measurement matrix, as run
+
+```
+                          A before(std)   B after(std)   C after(no_std)
+arctic_concurrent t1            52.4           51.3            52.9
+                  t2            54.4           53.9            53.7
+                  t4            52.5           52.2            53.1
+                  t8            53.0           52.5            53.8
+             t1/w20             54.6           53.4            53.7
+             t8/w20             59.0           59.7            57.6
+   t8/w20 under load            69.1           73.7            68.2
+micro-layers, worktable-arctic, ops/s, median of 5
+             point_read      4,360,854      4,127,534       4,262,501
+             update_field    2,603,124      2,525,446       2,516,823
+             insert          1,563,404      1,597,304       1,601,524
+             range_scan        217,648        218,611         224,422
+```
+
+Every one of those differences is inside the noise the controls demonstrate.
+**The branch is at parity with master at the application level and `no_std`
+costs nothing measurable there.** The only claim that cleared the bar was the
+negative one: without `inline(never)` the branch regressed 15-26% at p=0.00 on
+every size and thread count.
