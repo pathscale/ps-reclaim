@@ -64,6 +64,15 @@ criterion = "0.5"
 # `getrusage` in `benches/burst.rs`: wall clock cannot see a burnt core.
 libc = "0.2"
 
+# Only when `--cfg ps_loom` is set, so an ordinary build never fetches it.
+#
+#     RUSTFLAGS="--cfg ps_loom" cargo test --release --test loom_model
+#
+# Manual, like Miri: exhaustive interleaving exploration is not something to put
+# on every push.
+[target.'cfg(ps_loom)'.dev-dependencies]
+loom = "0.7"
+
 [[bench]]
 name = "pin"
 harness = false
