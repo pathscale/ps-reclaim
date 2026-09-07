@@ -285,7 +285,9 @@ fn main() {
     println!("CPU: release through reader shutdown; drain: release through last writer timestamp");
     println!("No affinity control; sampled update times include clocks and periodic reclamation.");
     println!("complete includes reader shutdown, observer accounting and final reclamation.");
-    println!("raw,think,round,position,arm,drain_ns,cpu_ns,reads,reclaimed,pending,cleanup_ns,cleanup_cpu_ns,complete_ns");
+    println!(
+        "raw,think,round,position,arm,drain_ns,cpu_ns,reads,reclaimed,pending,cleanup_ns,cleanup_cpu_ns,complete_ns"
+    );
     for think in [0u32, 100, 1_000, 10_000] {
         println!("\nreader think: {think} spin_loop iterations");
         println!(

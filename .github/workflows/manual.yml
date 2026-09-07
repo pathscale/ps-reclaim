@@ -28,10 +28,8 @@ permissions:
 
 jobs:
   # Miri checks exercised executions/provenance, not all weak-memory behavior.
-  # All branch gates below require removal after authorization to compile the
-  # source-only follow-up. Nothing here runs automatically or was dispatched.
   miri:
-    if: inputs.job == 'miri' && github.ref_name != 'fix/reclaim-review'
+    if: inputs.job == 'miri'
     name: Miri
     runs-on: ubicloud-standard-2
     timeout-minutes: 45
@@ -55,7 +53,7 @@ jobs:
   # The configurations consumers actually select. One job that loops them,
   # rather than a matrix that multiplies the runner count by four.
   features:
-    if: inputs.job == 'features' && github.ref_name != 'fix/reclaim-review'
+    if: inputs.job == 'features'
     name: Feature matrix
     runs-on: ubicloud-standard-2
     timeout-minutes: 25
@@ -96,7 +94,7 @@ jobs:
   # Explicit platform selection, not an automatic multi-runner matrix. Actual
   # Windows fiber switching and Darwin inline TSD need runtime target coverage.
   platforms:
-    if: inputs.job == 'platforms' && github.ref_name != 'fix/reclaim-review'
+    if: inputs.job == 'platforms'
     name: Platform runtime checks
     runs-on: ${{ inputs.platform }}
     timeout-minutes: 30
@@ -139,7 +137,7 @@ jobs:
           cargo +nightly clippy --lib --tests --no-default-features --features "$features" -- -D warnings
 
   loom:
-    if: inputs.job == 'loom' && github.ref_name != 'fix/reclaim-review'
+    if: inputs.job == 'loom'
     name: Reduced models (not full-crate proof)
     runs-on: ubicloud-standard-2
     timeout-minutes: 30
@@ -156,7 +154,7 @@ jobs:
   # shares a core with whatever else is on the box, so any number it produced
   # would be noise wearing a number's clothes.
   benches:
-    if: inputs.job == 'benches' && github.ref_name != 'fix/reclaim-review'
+    if: inputs.job == 'benches'
     name: Benchmarks compile
     runs-on: ubicloud-standard-2
     timeout-minutes: 20

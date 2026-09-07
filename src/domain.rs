@@ -770,7 +770,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| domain.advance()));
         assert!(result.is_err());
         assert_eq!(domain.pending(), 3);
-        assert_eq!(crate::sync::garbage_lock(&domain.garbage).entries[0].sequence, 1);
+        assert_eq!(
+            crate::sync::garbage_lock(&domain.garbage).entries[0].sequence,
+            1
+        );
         assert_eq!(domain.advance(), 3);
         assert_eq!(ran.load(Ordering::Relaxed), 3);
     }
