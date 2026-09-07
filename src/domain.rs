@@ -281,9 +281,11 @@ impl Domain {
         }
         // Only 40 epoch bits fit in a published pin. Never wrap them: after
         // saturation, reclamation conservatively requires a quiescent scan.
-        let _ = self.epoch.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
-            Some(epoch.saturating_add(1).min(MAX_EPOCH))
-        });
+        let _ = self
+            .epoch
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+                Some(epoch.saturating_add(1).min(MAX_EPOCH))
+            });
         n
     }
 }
@@ -588,7 +590,9 @@ mod tests {
         let freed = Arc::new(AtomicBool::new(false));
         let retired = Arc::clone(&freed);
         domain.retire(move || retired.store(true, Ordering::Release));
-        for _ in 0..4 { domain.advance(); }
+        for _ in 0..4 {
+            domain.advance();
+        }
         assert_eq!(domain.epoch.load(Ordering::Relaxed), MAX_EPOCH);
         assert!(!freed.load(Ordering::Acquire));
         drop(guard);

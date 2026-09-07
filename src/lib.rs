@@ -24,8 +24,8 @@
 //! # What a domain is
 //!
 //! One grace period. Normal pins are domain-specific; overflow wildcard pins
-//! delay every domain. Packed domain-ID collisions are conservative. Domains are a
-//! few words, because the participant registry is process-wide rather than
+//! delay every domain. Packed domain-ID collisions are conservative. Domains
+//! are a few words, because the participant registry is process-wide rather than
 //! per-domain. That matters when there is a domain per table and a thousand
 //! tables.
 //!
@@ -41,7 +41,10 @@
 // library does not link `std`, since a test binary cannot.
 // Native no_std TLS is Unix-only: a platform-key lease closes its cache at
 // teardown. Windows keeps cache and lease together in FLS (fiber lifetime).
-#![cfg_attr(all(not(feature = "std"), feature = "nightly", unix), feature(thread_local))]
+#![cfg_attr(
+    all(not(feature = "std"), feature = "nightly", unix),
+    feature(thread_local)
+)]
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(missing_docs)]
 

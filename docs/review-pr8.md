@@ -1,10 +1,17 @@
 # Source-only follow-up to PR #7
 
-This branch is stacked on `perf/handle-api` at
-`3ded58b9ccf3b1585c72dda3d35ba0130f257332`. It is best-effort source, not
+This branch is stacked on `perf/handle-api`, including its updated head
+`460688aced65a407412382654b7007cdc6c1aa73`. It is best-effort source, not
 validated HFT software. No compilation, formatter, tests, benchmarks, Miri or
-Loom runs were performed. The existing compiled CI targets `master`, not this
-stack's base; absence of a failing check is not evidence of correctness.
+Loom runs were performed. Parent PR #7 enabled CI for stacked PRs during this
+work; the workflow now explicitly skips compiled jobs while `fix/reclaim-review`
+is a draft. Other PRs are unaffected. Do not mark this PR ready or remove that
+guard until compilation is authorized. Skipped checks are not validation.
+
+The parent update independently improved the benchmark and restricted native
+TLS to Unix. This branch retains that restriction and extends the benchmark
+with reader readiness, pre-release timing, persistent cross-arm registrations,
+counterbalanced warmups, exact destructor counts, and in-burst advancement.
 
 ## Reclamation cutoff
 

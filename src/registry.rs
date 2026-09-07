@@ -82,9 +82,12 @@ impl Registry {
         }
         // Keep the diagnostic counter monotonic even on long-lived 32-bit
         // targets. Wrapping could hand out an exclusive slot still in use.
-        let idx = self.next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-            next.checked_add(1)
-        }).unwrap_or(usize::MAX);
+        let idx = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or(usize::MAX);
         if idx < MAX_THREADS - 1 {
             (idx, false)
         } else {
@@ -107,7 +110,9 @@ impl Registry {
         // slot. Leaking the registration in this exceptional case is safer
         // than permitting a new owner to overwrite a still-live reader.
         if p.wildcard.load(Ordering::Acquire) != 0
-            || p.pins.iter().any(|pin| pin.load(Ordering::Acquire) != NO_DOMAIN)
+            || p.pins
+                .iter()
+                .any(|pin| pin.load(Ordering::Acquire) != NO_DOMAIN)
         {
             return;
         }
@@ -202,7 +207,10 @@ struct OwnedLocal {
 #[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 impl OwnedLocal {
     fn new() -> Self {
-        Self { local: Local::new(), lease: RefCell::new(None) }
+        Self {
+            local: Local::new(),
+            lease: RefCell::new(None),
+        }
     }
 }
 
@@ -250,18 +258,27 @@ pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
 #[cfg(feature = "std")]
 #[inline]
 fn install_lease(lease: SlotLease) -> bool {
-    LEASE.try_with(|l| *l.borrow_mut() = Some(ThreadLease { _lease: lease })).is_ok()
+    LEASE
+        .try_with(|l| *l.borrow_mut() = Some(ThreadLease { _lease: lease }))
+        .is_ok()
 }
 
 #[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[inline]
 fn install_lease(lease: SlotLease) -> bool {
-    LEASE.with(|| RefCell::new(None), |l| *l.borrow_mut() = Some(ThreadLease { _lease: lease })).is_some()
+    LEASE
+        .with(
+            || RefCell::new(None),
+            |l| *l.borrow_mut() = Some(ThreadLease { _lease: lease }),
+        )
+        .is_some()
 }
 
 #[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 fn install_lease(lease: SlotLease) -> bool {
-    LOCAL.get(|owned| *owned.lease.borrow_mut() = Some(lease)).is_some()
+    LOCAL
+        .get(|owned| *owned.lease.borrow_mut() = Some(lease))
+        .is_some()
 }
 
 /// Access only an existing Local. Guard destruction must not initialize a new
@@ -308,7 +325,10 @@ fn register(local: &Local) -> &'static Participant {
     let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];
     // Install ownership before publishing a cache that readers can use.
-    assert!(install_lease(SlotLease(idx, shared)), "cannot install registration during teardown");
+    assert!(
+        install_lease(SlotLease(idx, shared)),
+        "cannot install registration during teardown"
+    );
     local.mine.set(Some(p));
     local.shared.set(shared);
     p
