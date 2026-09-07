@@ -41,8 +41,12 @@ identical work. Some very short bursts may finish before a reader runs.
 
 Each writer retires one owned allocation every 64 updates and immediately calls
 `advance_up_to(8)`. An observable counter verifies all 60 callbacks per burst
-have run after the quiescent final drain. Final draining and assertions are
-outside the timed interval. The retired payload is not the atomic book and is
+have run after the quiescent final drain. Raw rows now also report callbacks
+completed by the last writer and the pending count before cleanup: their sum
+must equal the per-burst retirement count. Final cleanup has separate wall/CPU
+measurements, plus an end-to-end wall interval through cleanup (including
+observer accounting and reader shutdown). Equal update counts do not imply
+equal reclamation work inside the writer-only window. The retired payload is not the atomic book and is
 never published to a reader: this exercises reclamation work, not pointer
 safety. Correctness tests cover protection separately.
 
@@ -51,6 +55,12 @@ retirement/reclamation. The harness includes allocator costs, barrier skew,
 channel/report overhead in the CPU window, and OS scheduling. It does not pin
 threads to cores, control frequency/NUMA, or represent a production feed.
 P99.9 of pooled synthetic updates is not an HFT tail-latency guarantee.
+
+Raw CSV-prefixed rows are emitted only after all workers join, preserving round,
+arm position, counts and timing pairs before aggregate sorting. Matching TLS
+controls can rule out some order effects, but share code layout, participant
+placement and scheduling confounders. They do not identify a TLS mechanism or
+establish that handles have more predictable production latency.
 
 ## Isolating the garbage mutex
 

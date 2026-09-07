@@ -2,7 +2,7 @@
 
 use crate::sync::GarbageMutex as Mutex;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
@@ -32,7 +32,24 @@ struct Retirement {
 
 struct Garbage {
     next_sequence: u64,
-    entries: Vec<Retirement>,
+    entries: VecDeque<Retirement>,
+}
+
+/// If a callback unwinds, return the callbacks not yet invoked to their domain.
+/// Keep original stamps: a concurrent scan must still respect its own cutoff.
+struct ReclaimBatch<'a> {
+    domain: &'a Domain,
+    entries: VecDeque<Retirement>,
+}
+
+impl Drop for ReclaimBatch<'_> {
+    fn drop(&mut self) {
+        if !self.entries.is_empty() {
+            crate::sync::garbage_lock(&self.domain.garbage)
+                .entries
+                .append(&mut self.entries);
+        }
+    }
 }
 
 /// One grace period.
@@ -71,7 +88,7 @@ impl Domain {
             epoch: AtomicU64::new(1),
             garbage: Mutex::new(Garbage {
                 next_sequence: 0,
-                entries: Vec::new(),
+                entries: VecDeque::new(),
             }),
         }
     }
@@ -85,7 +102,15 @@ impl Domain {
     /// After registration, a normal pin uses a thread-local read, a relaxed
     /// epoch load, a store to its own padded slot, and a fence. Overflow pins
     /// instead increment a wildcard counter, shared on registry overflow.
-    #[inline]
+    //  is worth 33% at the application level and nothing in a
+    // microbenchmark, which is why it took a full-stack A/B to find.
+    //
+    // Folding the three thread-locals into one put the whole pin body inline at
+    // every call site. Arctic calls this inside a radix-tree walk, so the bloat
+    // lands in the hot loop: wt-benchmarks arctic_concurrent went 52.1 to 69.5
+    // ns per lookup at 8192 keys. Outlining it restores 52.1 exactly. A pin
+    // measured on its own sees none of this, and said the fold made it faster.
+    #[inline(never)]
     pub fn pin(&self) -> Guard<'_> {
         // One thread-local lookup for the whole pin. The participant, the
         // shared-slot flag and the pin mask are fields of one `Local`.
@@ -138,6 +163,9 @@ impl Domain {
             (p, entry)
         });
 
+        // Release publication also carries preceding accesses across an
+        // unpin/repin if a scanner observes the repin instead of the idle store.
+        // Do not rely on a relaxed repin extending a prior release sequence.
         // Publish the pin before any protected pointer is loaded. Paired with
         // the fence in `advance`; without both, a reclaimer can read this slot
         // as idle while this thread goes on to load a pointer it is freeing.
@@ -150,6 +178,12 @@ impl Domain {
     ///
     /// Does not pin. Call it while holding the guard under which the pointer
     /// was unlinked.
+    ///
+    /// Callback order is unspecified. Callbacks should not panic. If one
+    /// unwinds from `advance`, it is not retried, but callbacks not yet invoked
+    /// are returned to the queue. During domain destruction there is no queue
+    /// to return to: an unwinding callback drops the remaining captures without
+    /// invoking their callbacks. Use non-panicking cleanup for owned resources.
     pub fn retire<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -162,7 +196,7 @@ impl Domain {
         garbage.next_sequence = sequence
             .checked_add(1)
             .expect("retirement sequence exhausted");
-        garbage.entries.push(Retirement {
+        garbage.entries.push_back(Retirement {
             sequence,
             epoch: e,
             run,
@@ -176,8 +210,41 @@ impl Domain {
         crate::sync::garbage_lock(&self.garbage).entries.len()
     }
 
+    /// Remaining epoch increments before conservative saturation. A diagnostic
+    /// snapshot, not a reservation: concurrent advancement consumes headroom.
+    /// Plan an exclusive maintenance window before this approaches zero.
+    pub fn epoch_headroom(&self) -> u64 {
+        MAX_EPOCH - self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// Renew epoch headroom during an exclusive maintenance window.
+    ///
+    /// The mutable borrow excludes concurrent pins, retirements and scans,
+    /// just as domain destruction excludes live guards. Existing retirements
+    /// become older than every new pin, without invoking callbacks or changing
+    /// their publication sequences. This takes O(pending) metadata work.
+    /// It does not erase any registration or recover a forgotten guard's slot.
+    ///
+    /// This is NOT transparent rollover: arrange exclusive ownership before
+    /// saturation. For an Arc-owned domain, workers must relinquish their Arc
+    /// references before Arc::get_mut can provide this maintenance access.
+    ///
+    /// ```compile_fail
+    /// let mut domain = ps_reclaim::Domain::new();
+    /// let guard = domain.pin();
+    /// domain.renew_epoch();
+    /// drop(guard);
+    /// ```
+    pub fn renew_epoch(&mut self) {
+        for retirement in &mut crate::sync::garbage_get_mut(&mut self.garbage).entries {
+            retirement.epoch = 0;
+        }
+        *self.epoch.get_mut() = 1;
+    }
+
     /// Run eligible retirements from a pre-scan snapshot. Returns how many ran.
-    /// A nonempty, non-wildcard-blocked scan advances the epoch, unless saturated.
+    /// A nonempty, non-wildcard-blocked scan attempts to advance the epoch.
+    /// Concurrent advancement or epoch saturation may prevent it.
     ///
     /// Never waits for readers, which is the property that matters and is not
     /// the same as never blocking: this takes the domain's own garbage lock,
@@ -186,6 +253,9 @@ impl Domain {
     /// pinned, that retirement is simply not run yet. A reader that started
     /// in a later epoch does not hold it up. Readers in the retirement's
     /// epoch conservatively delay it, even if they started after retirement.
+    /// Epochs saturate rather than wrapping unsafely. At saturation new garbage
+    /// requires a scan without matching pins. Monitor [`Self::epoch_headroom`]
+    /// and arrange [`Self::renew_epoch`] with exclusive access before that point.
     pub fn advance(&self) -> usize {
         self.advance_up_to(usize::MAX)
     }
@@ -256,34 +326,50 @@ impl Domain {
         }
 
         after_scan();
-        let expired: Vec<Deferred> = {
+        let mut expired = ReclaimBatch {
+            domain: self,
+            entries: VecDeque::new(),
+        };
+        {
             let mut garbage = crate::sync::garbage_lock(&self.garbage);
             // Strictly less than: something retired in the same epoch a reader
             // pinned in may still be reachable by that reader.
             //
-            // `extract_if` drains in place. The previous `partition` moved the
-            // whole queue into two fresh `Vec`s and wrote one back on every
-            // call, so a domain holding a long backlog paid for the backlog on
-            // each advance even when nothing had expired. Concurrent retire
-            // calls can sample epochs out of order; inspect each entry.
-            garbage
-                .entries
-                .extract_if(.., |r| r.sequence < cutoff && r.epoch < min_pinned)
-                .take(limit)
-                .map(|r| r.run)
-                .collect()
-        };
+            // Pop/rotate, never compact the unchecked tail. Vec::extract_if
+            // followed by take(k) moved N-k records on iterator destruction,
+            // making a ready backlog cost quadratic work to drain in batches.
+            // Inspect each initially queued entry at most once. Rotation also
+            // permits out-of-order epochs and callbacks requeued after unwind.
+            let queued = garbage.entries.len();
+            for _ in 0..queued {
+                if expired.entries.len() == limit {
+                    break;
+                }
+                let retirement = garbage.entries.pop_front().expect("snapshot entry");
+                if retirement.sequence < cutoff && retirement.epoch < min_pinned {
+                    expired.entries.push_back(retirement);
+                } else {
+                    garbage.entries.push_back(retirement);
+                }
+            }
+        }
 
         // Outside the lock: a retirement may retire more.
-        let n = expired.len();
-        for f in expired {
-            f();
+        let n = expired.entries.len();
+        while let Some(retirement) = expired.entries.pop_front() {
+            (retirement.run)();
         }
-        // Only 40 epoch bits fit in a published pin. Never wrap them: after
-        // saturation, reclamation conservatively requires a quiescent scan.
-        let _ = self.epoch.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
-            Some(epoch.saturating_add(1).min(MAX_EPOCH))
-        });
+        // Only 40 epoch bits fit in a pin. Keep saturation conservative. A
+        // reader can pause between sampling an epoch and publishing its pin;
+        // modular decoding plus a scan-based age cap is NOT sufficient for
+        // safe rollover. Renewal instead requires exclusive domain ownership.
+        // CAS avoids repeatedly advancing on behalf of a stale concurrent scan.
+        let _ = self.epoch.compare_exchange(
+            now,
+            now.saturating_add(1).min(MAX_EPOCH),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         n
     }
 }
@@ -588,12 +674,116 @@ mod tests {
         let freed = Arc::new(AtomicBool::new(false));
         let retired = Arc::clone(&freed);
         domain.retire(move || retired.store(true, Ordering::Release));
-        for _ in 0..4 { domain.advance(); }
+        for _ in 0..4 {
+            domain.advance();
+        }
         assert_eq!(domain.epoch.load(Ordering::Relaxed), MAX_EPOCH);
         assert!(!freed.load(Ordering::Acquire));
         drop(guard);
         domain.advance();
         assert!(freed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exclusive_renewal_restores_headroom_and_preserves_pending_work() {
+        let mut domain = Domain::new();
+        domain.epoch.store(MAX_EPOCH, Ordering::Relaxed);
+        assert_eq!(domain.epoch_headroom(), 0);
+        let freed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&freed);
+        domain.retire(move || flag.store(true, Ordering::Release));
+        domain.renew_epoch();
+        assert_eq!(domain.epoch_headroom(), MAX_EPOCH - 1);
+        assert_eq!(domain.pending(), 1);
+        assert!(
+            !freed.load(Ordering::Acquire),
+            "renewal must not invoke callbacks"
+        );
+        {
+            let garbage = crate::sync::garbage_lock(&domain.garbage);
+            assert_eq!(garbage.next_sequence, 1);
+            assert_eq!(garbage.entries[0].sequence, 0);
+            assert_eq!(garbage.entries[0].epoch, 0);
+        }
+        let fresh = domain.pin();
+        assert_eq!(domain.advance(), 1, "new reader delayed pre-renewal work");
+        assert!(freed.load(Ordering::Acquire));
+        drop(fresh);
+    }
+
+    #[test]
+    fn stale_scan_does_not_advance_a_newer_epoch() {
+        let domain = Domain::new();
+        domain.retire(|| ());
+        domain.advance_with(1, || {
+            assert_eq!(domain.advance(), 1);
+            assert_eq!(domain.epoch.load(Ordering::Relaxed), 2);
+        });
+        assert_eq!(domain.epoch.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn bounded_ready_batch_does_not_move_the_unchecked_tail() {
+        let domain = Domain::new();
+        for _ in 0..4096 {
+            domain.retire(|| ());
+        }
+        let tail = {
+            let garbage = crate::sync::garbage_lock(&domain.garbage);
+            &garbage.entries[8] as *const Retirement
+        };
+        assert_eq!(domain.advance_up_to(8), 8);
+        let garbage = crate::sync::garbage_lock(&domain.garbage);
+        assert_eq!(garbage.entries.len(), 4088);
+        assert!(
+            core::ptr::eq(&garbage.entries[0], tail),
+            "unchecked records moved"
+        );
+    }
+
+    #[test]
+    fn blocked_prefix_does_not_hide_an_older_eligible_retirement() {
+        let domain = Domain::new();
+        domain.epoch.store(2, Ordering::Relaxed);
+        let held = domain.pin();
+        domain.retire(|| ()); // blocked epoch-2 prefix
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        domain.retire(move || flag.store(true, Ordering::Release));
+        // Model a writer that sampled epoch 1, paused, and enqueued after the
+        // epoch-2 retirement. Publication sequence and epoch need not agree.
+        crate::sync::garbage_lock(&domain.garbage)
+            .entries
+            .back_mut()
+            .unwrap()
+            .epoch = 1;
+        assert_eq!(domain.advance_up_to(1), 1);
+        assert!(ran.load(Ordering::Acquire));
+        assert_eq!(domain.pending(), 1);
+        drop(held);
+        assert_eq!(domain.advance(), 1);
+    }
+
+    #[test]
+    fn callback_unwind_requeues_uninvoked_work_with_original_sequence() {
+        let domain = Domain::new();
+        let ran = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        domain.retire(|| panic!("expected callback panic"));
+        for _ in 0..3 {
+            let ran = Arc::clone(&ran);
+            domain.retire(move || {
+                ran.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| domain.advance()));
+        assert!(result.is_err());
+        assert_eq!(domain.pending(), 3);
+        assert_eq!(
+            crate::sync::garbage_lock(&domain.garbage).entries[0].sequence,
+            1
+        );
+        assert_eq!(domain.advance(), 3);
+        assert_eq!(ran.load(Ordering::Relaxed), 3);
     }
 
     #[test]

@@ -5,58 +5,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 
 use ps_reclaim::Domain;
 
-/// A thread whose pin can be opened and closed on command, so a test can
-/// arrange overlaps that a single thread cannot express.
-struct RemoteReader {
-    cmd: Option<mpsc::Sender<bool>>,
-    ack: mpsc::Receiver<()>,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl RemoteReader {
-    fn spawn(domain: Arc<Domain>) -> Self {
-        let (cmd, rx) = mpsc::channel::<bool>();
-        let (tx, ack) = mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            let mut held = None;
-            while let Ok(pin) = rx.recv() {
-                held = if pin { Some(domain.pin()) } else { None };
-                if tx.send(()).is_err() {
-                    break;
-                }
-            }
-            drop(held);
-        });
-        Self {
-            cmd: Some(cmd),
-            ack,
-            handle: Some(handle),
-        }
-    }
-
-    fn pin(&self) {
-        self.cmd.as_ref().unwrap().send(true).unwrap();
-        self.ack.recv().unwrap();
-    }
-
-    fn unpin(&self) {
-        self.cmd.as_ref().unwrap().send(false).unwrap();
-        self.ack.recv().unwrap();
-    }
-}
-
-impl Drop for RemoteReader {
-    fn drop(&mut self) {
-        self.cmd.take();
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
-    }
-}
+mod support;
+use support::RemoteReader;
 
 fn drive(domain: &Domain, hits: &AtomicUsize, want: usize) {
     for _ in 0..64 {
@@ -99,9 +52,8 @@ fn a_reader_older_than_the_retirement_holds_it() {
 /// Guarantee 2, the one that separates schemes: reclamation progresses even
 /// though there is never an instant with zero readers.
 ///
-/// A reference-counted scheme waits for a quiescent instant and so reclaims
-/// nothing at all under continuous read traffic. `seize` fails this; so does a
-/// plain global reader counter.
+/// A plain global reader counter cannot reclaim during this overlap. This is
+/// not a comparative test of other libraries or of per-retirement counters.
 #[test]
 fn a_reader_newer_than_the_retirement_does_not_hold_it() {
     let domain = Arc::new(Domain::new());
