@@ -3,8 +3,9 @@ name: Rust
 on:
   push:
     branches: [ "master" ]
+  # Any target branch, not just master. A stacked PR against a feature branch
+  # reported zero checks and nobody noticed until a reviewer pointed at it.
   pull_request:
-    branches: [ "master" ]
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,46 +1,57 @@
-//! What a thread-local lookup costs a pin, under a burst rather than in a loop.
+//! What the pin path costs a burst of writes, with readers running throughout.
 //!
-//! # Why this exists, and why it is not `benches/pin.rs`
+//! # What this measures, and what an earlier version of it measured instead
 //!
-//! `pin.rs` measures a pin in a tight loop. That is the right shape for
-//! comparing reclamation schemes and the wrong one for comparing *lookup
-//! mechanisms*, because a loop lets the optimiser hoist a `thread_local!`
-//! address out of it and never lets it hoist an opaque `pthread_getspecific`.
-//! Measured that way, the answer is a statement about the optimiser.
+//! A review of the first version established that it measured mostly the wrong
+//! thing, and the correction is worth stating because the mistake is easy:
 //!
-//! This is the burst shape a market-data feed produces, deliberately the same
-//! as `parking_lot_lite_hack`'s `benches/burst.rs` so the two read against each
-//! other: 200 symbols by 20 levels rewritten per burst, four writers each
-//! owning a contiguous shard, four readers querying throughout, twenty bursts.
-//! What decides whether a feed keeps up is how fast a burst drains and how bad
-//! the worst update in it is, so that is what is reported.
+//! - It spawned eight threads *inside* the timed interval and joined them
+//!   inside it too, so thread creation, first-touch registration, buffer
+//!   allocation and reader shutdown were all charged to "burst drain". Measured
+//!   directly, that envelope with **zero updates in it** is 0.191 ms on the
+//!   thread-local arm and 0.154 ms on the handle arm, against reported drains
+//!   of 0.28 and 0.13. The lifecycle was most of the number, and it already
+//!   differed between the arms by 1.24x before any work happened.
+//! - It never reclaimed. Nothing called `advance`, the domain was leaked, and
+//!   the retirements were no-op closures, so the registry scan and the
+//!   cross-core traffic that a real reclamation workload generates never
+//!   happened at all.
+//!
+//! So this version:
+//!
+//! - Spawns workers **once**, has them register **once**, and starts timing
+//!   only after every one of them is parked on a barrier.
+//! - Times from the barrier release to the last writer finishing, on a second
+//!   barrier. Readers keep running across bursts and are stopped afterwards, so
+//!   their shutdown is outside every measured interval.
+//! - Reclaims for real: retirements own an allocation whose `Drop` increments a
+//!   counter, `advance_up_to` runs between bursts, and the harness **asserts**
+//!   that the deferred work actually executed. A run that reclaims nothing is a
+//!   failed run, not a fast one.
+//! - Runs the arms in a counterbalanced order, `A B B A`, and reports each
+//!   position separately, because a null measures repeatability at a position
+//!   rather than the absence of a position effect.
+//! - Reports reader operation counts, so the CPU column describes comparable
+//!   work rather than whichever arm let its readers spin more.
 //!
 //! # The two arms
 //!
-//! Identical in every respect but the pin: same sharding, same key order, same
-//! counts, same latency sampling, same branch. One pins through `Domain::pin`,
-//! which finds this thread's registration in thread-local storage; the other
-//! through a `Handle`, which was handed it. **Whatever they differ by is what
-//! the lookup costs**, and that depends entirely on the build:
+//! Identical but for the pin: one finds this thread's registration in
+//! thread-local storage, the other was handed it. Run both builds:
 //!
 //! ```text
 //! cargo bench --bench burst
 //! cargo bench --bench burst --no-default-features --features libc,spin
 //! ```
 //!
-//! With `std` a thread-local is an offset from the thread pointer and the two
-//! arms are the same, so the handle is not worth its API cost. Without `std` it
-//! is a `pthread_getspecific` call and the handle is roughly twice the
-//! throughput at a third of the CPU.
-//!
-//! The book is a flat `Vec<AtomicU64>`, not a map: these arms are not measuring
-//! a data structure. Every read and every write happens under a pin, which is
-//! the traffic being measured, with a retirement every 64 updates so the
-//! reclaimer runs rather than idles.
+//! Per-update `Instant::now()` is still in the writer loop, because tail
+//! latency is the point of a burst benchmark. It is a real share of a ~200 ns
+//! update and both arms pay it identically; read the arms against each other,
+//! never as absolute throughput.
 
 use std::hint::black_box;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use ps_reclaim::Domain;
@@ -49,13 +60,25 @@ use ps_reclaim::Domain;
 const SYMBOLS: u64 = 200;
 /// Book levels rewritten per symbol per burst.
 const LEVELS: u64 = 20;
-/// Threads delivering the burst. Deliberately short of the core count: at one
-/// thread per core the harness has no headroom and the arms drift by more than
-/// they differ.
+/// Threads delivering the burst.
 const WRITERS: usize = 4;
 /// Consumers querying throughout.
 const READERS: usize = 4;
 const BURSTS: usize = 20;
+/// Updates between retirements, per writer.
+const RETIRE_EVERY: u64 = 64;
+
+/// Counts destructors that actually ran, so a run that reclaims nothing fails.
+static RECLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+/// A retirement with real work in it: an allocation whose `Drop` is observable.
+struct Deferred(#[allow(dead_code)] Box<[u64; 8]>);
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        RECLAIMED.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 fn cpu() -> Duration {
     // SAFETY: `getrusage` fills the `rusage` for `RUSAGE_SELF` or returns
@@ -70,31 +93,39 @@ fn cpu() -> Duration {
     part(usage.ru_utime) + part(usage.ru_stime)
 }
 
-/// One burst. `use_handle` picks how a pin finds this thread's registration.
-///
-/// The branch sits inside the loop rather than outside it so that both arms pay
-/// it. It is perfectly predicted and identical in each, which is the point: the
-/// only thing that differs between the arms is the pin.
-fn burst(think: u32, use_handle: bool) -> (Duration, Duration, Vec<Duration>) {
-    let domain: &'static Domain = Box::leak(Box::new(Domain::new()));
-    let book: Arc<Vec<AtomicU64>> = Arc::new((0..SYMBOLS * LEVELS).map(AtomicU64::new).collect());
-    let stop = Arc::new(AtomicBool::new(false));
-    let samples = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+struct Outcome {
+    drains: Vec<Duration>,
+    latencies: Vec<Duration>,
+    cpu: Duration,
+    reader_ops: u64,
+    reclaimed: usize,
+}
 
-    let before = cpu();
-    let started = Instant::now();
+fn run_arm(use_handle: bool, think: u32) -> Outcome {
+    let domain = Domain::new();
+    let book: Vec<AtomicU64> = (0..SYMBOLS * LEVELS).map(AtomicU64::new).collect();
+    let stop = AtomicBool::new(false);
+    let reader_ops = AtomicU64::new(0);
+    let samples: Mutex<Vec<Duration>> = Mutex::new(Vec::new());
+    // Writers plus this thread. Readers are deliberately not in the barriers:
+    // they run continuously across every burst.
+    let release = Arc::new(Barrier::new(WRITERS + 1));
+    let done = Arc::new(Barrier::new(WRITERS + 1));
+
+    let before_reclaimed = RECLAIMED.load(Ordering::Relaxed);
+    let mut drains = Vec::with_capacity(BURSTS);
+    let mut before_cpu = Duration::ZERO;
+    let mut arm_cpu = Duration::ZERO;
+
     std::thread::scope(|scope| {
         for _ in 0..READERS {
-            let book = Arc::clone(&book);
-            let stop = Arc::clone(&stop);
+            let (domain, book, stop, reader_ops) = (&domain, &book, &stop, &reader_ops);
             scope.spawn(move || {
-                let handle = if use_handle {
-                    Some(domain.handle())
-                } else {
-                    None
-                };
+                // Register before anyone starts timing.
+                let handle = use_handle.then(|| domain.handle());
                 let mut acc = 0u64;
                 let mut key = 0u64;
+                let mut ops = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     key = key.wrapping_add(2_654_435_761) % (SYMBOLS * LEVELS);
                     if let Some(h) = &handle {
@@ -106,29 +137,29 @@ fn burst(think: u32, use_handle: bool) -> (Duration, Duration, Vec<Duration>) {
                         acc ^= book[key as usize].load(Ordering::Relaxed);
                         black_box(&g);
                     }
+                    ops += 1;
                     for _ in 0..think {
                         core::hint::spin_loop();
                     }
                 }
+                reader_ops.fetch_add(ops, Ordering::Relaxed);
                 black_box(acc);
             });
         }
-        let writers: Vec<_> = (0..WRITERS)
-            .map(|w| {
-                let book = Arc::clone(&book);
-                let samples = Arc::clone(&samples);
-                scope.spawn(move || {
-                    let handle = if use_handle {
-                        Some(domain.handle())
-                    } else {
-                        None
-                    };
-                    let mut mine = Vec::with_capacity((SYMBOLS / WRITERS as u64 * LEVELS) as usize);
-                    // Each writer owns a contiguous slice of symbols, as a feed
-                    // handler shard would.
-                    let per = SYMBOLS / WRITERS as u64;
-                    let from = w as u64 * per;
-                    let mut n = 0u64;
+
+        for w in 0..WRITERS {
+            let (domain, book, samples) = (&domain, &book, &samples);
+            let (release, done) = (Arc::clone(&release), Arc::clone(&done));
+            scope.spawn(move || {
+                let handle = use_handle.then(|| domain.handle());
+                let per = SYMBOLS / WRITERS as u64;
+                let from = w as u64 * per;
+                let mut mine = Vec::with_capacity(BURSTS * (per * LEVELS) as usize);
+                let mut n = 0u64;
+                for _ in 0..BURSTS {
+                    // Every worker is registered, allocated and parked here.
+                    // Nothing before this point is inside a measured interval.
+                    release.wait();
                     for symbol in from..from + per {
                         for level in 0..LEVELS {
                             let key = symbol * LEVELS + level;
@@ -143,24 +174,47 @@ fn burst(think: u32, use_handle: bool) -> (Duration, Duration, Vec<Duration>) {
                                 black_box(&g);
                             }
                             n += 1;
-                            if n.is_multiple_of(64) {
-                                domain.retire(|| ());
+                            if n.is_multiple_of(RETIRE_EVERY) {
+                                let junk = Deferred(Box::new([key; 8]));
+                                domain.retire(move || drop(junk));
                             }
                             mine.push(at.elapsed());
                         }
                     }
-                    samples.lock().expect("not poisoned").extend(mine);
-                })
-            })
-            .collect();
-        for writer in writers {
-            writer.join().expect("writer");
+                    done.wait();
+                }
+                samples.lock().expect("not poisoned").extend(mine);
+            });
         }
+
+        // Warm: let the readers reach steady state before the first burst.
+        std::thread::sleep(Duration::from_millis(2));
+        before_cpu = cpu();
+        for _ in 0..BURSTS {
+            release.wait();
+            let at = Instant::now();
+            done.wait();
+            // The last writer has finished. Readers are still running, and
+            // their shutdown is outside every interval this records.
+            drains.push(at.elapsed());
+            // Reclaim between bursts rather than never.
+            domain.advance_up_to(4096);
+        }
+        arm_cpu = cpu() - before_cpu;
         stop.store(true, Ordering::Relaxed);
     });
-    let drained = started.elapsed();
-    let latencies = core::mem::take(&mut *samples.lock().expect("not poisoned"));
-    (drained, cpu() - before, latencies)
+
+    // Drain whatever the last burst left, so the assertion below is about the
+    // whole arm rather than about timing.
+    while domain.advance_up_to(4096) != 0 {}
+
+    Outcome {
+        drains,
+        latencies: core::mem::take(&mut *samples.lock().expect("not poisoned")),
+        cpu: arm_cpu,
+        reader_ops: reader_ops.load(Ordering::Relaxed),
+        reclaimed: RECLAIMED.load(Ordering::Relaxed) - before_reclaimed,
+    }
 }
 
 fn median(mut v: Vec<Duration>) -> Duration {
@@ -175,48 +229,64 @@ fn pct(v: &[Duration], p: f64) -> Duration {
 fn main() {
     let updates = SYMBOLS * LEVELS;
     println!(
-        "\n  {SYMBOLS} symbols x {LEVELS} levels per burst, {WRITERS} writers, {READERS} readers, {BURSTS} bursts.\n\
-         \n  thru  = updates per second while a burst is draining, in millions.\n  \
-           drain = time for a whole burst to land; the feed sends one every 500 ms.\n  \
-           p50..max = latency of one update, across every update of every burst.\n\
-         \n  The arms differ only in how a pin finds this thread's registration.\n  \
-           The third row is the first arm again, so the table carries its own\n  \
-           noise floor: whatever it differs from row one by is drift."
+        "\n  {SYMBOLS} symbols x {LEVELS} levels per burst, {WRITERS} writers, {READERS} readers,\n  \
+           {BURSTS} bursts. Workers are spawned and registered once, before any timing.\n  \
+           Each burst is timed from a release barrier to the last writer finishing;\n  \
+           readers run throughout and are stopped outside every interval.\n\
+         \n  Arms run counterbalanced, tls-handle-handle-tls, three times over. Read the\n  \
+           spread WITHIN an arm across its six positions first: if that rivals the gap\n  \
+           between the arms, the row is a position effect and not a result.\n\
+         \n  reclaimed = deferred destructors that actually ran. Zero is a failed run.\n  \
+           rd kops   = reader operations completed, in thousands. The arms do NOT do\n  
+           equal reader work: cheaper pins let readers spin faster, so the\n  
+           faster arm faces MORE read traffic on the same cache lines. That\n  
+           confound runs against the faster arm, not for it."
     );
 
     for think in [0u32, 100, 1_000, 10_000] {
         println!("\n  reader think time: {think}");
-        println!("                        thru   cpu ms    drain ms          update latency ms");
         println!(
-            "  pin path              M/s   median   median   worst    p50     p99   p99.9     max"
+            "                     thru    cpu ms    drain ms         update latency ms       rd kops  reclaimed"
         );
-        for (name, use_handle) in [
-            ("thread-local", false),
-            ("handle", true),
-            ("null (thread-local)", false),
+        println!(
+            "  pos  arm          M/s     total   median   worst    p50     p99   p99.9    max     (k)"
+        );
+        for (pos, use_handle) in [
+            (1, false),
+            (2, true),
+            (3, true),
+            (4, false),
+            (5, false),
+            (6, true),
+            (7, true),
+            (8, false),
+            (9, false),
+            (10, true),
+            (11, true),
+            (12, false),
         ] {
-            let mut drains = Vec::with_capacity(BURSTS);
-            let mut cpus = Vec::with_capacity(BURSTS);
-            let mut latencies = Vec::with_capacity(BURSTS * updates as usize);
-            for _ in 0..BURSTS {
-                let (drain, burst_cpu, mut samples) = burst(think, use_handle);
-                drains.push(drain);
-                cpus.push(burst_cpu);
-                latencies.append(&mut samples);
-            }
-            latencies.sort_unstable();
-            let drain_median = median(drains.clone());
-            let worst = drains.into_iter().max().unwrap_or_default();
+            let out = run_arm(use_handle, think);
+            assert!(
+                out.reclaimed > 0,
+                "no deferred work ran: this arm measured nothing about reclamation"
+            );
+            let mut lat = out.latencies;
+            lat.sort_unstable();
+            let drain_median = median(out.drains.clone());
+            let worst = out.drains.into_iter().max().unwrap_or_default();
             let thru = updates as f64 / drain_median.as_secs_f64() / 1e6;
             println!(
-                "  {name:<20} {thru:>5.2} {:>8.2} {:>8.2} {:>7.2} {:>7.3} {:>7.3} {:>7.3} {:>7.3}",
-                median(cpus).as_secs_f64() * 1e3,
+                "  {pos}    {:<11} {thru:>5.2} {:>8.2} {:>8.2} {:>7.2} {:>7.3} {:>7.3} {:>7.3} {:>6.3} {:>7.1} {:>8}",
+                if use_handle { "handle" } else { "thread-local" },
+                out.cpu.as_secs_f64() * 1e3,
                 drain_median.as_secs_f64() * 1e3,
                 worst.as_secs_f64() * 1e3,
-                pct(&latencies, 0.50).as_secs_f64() * 1e3,
-                pct(&latencies, 0.99).as_secs_f64() * 1e3,
-                pct(&latencies, 0.999).as_secs_f64() * 1e3,
-                latencies.last().copied().unwrap_or_default().as_secs_f64() * 1e3,
+                pct(&lat, 0.50).as_secs_f64() * 1e3,
+                pct(&lat, 0.99).as_secs_f64() * 1e3,
+                pct(&lat, 0.999).as_secs_f64() * 1e3,
+                lat.last().copied().unwrap_or_default().as_secs_f64() * 1e3,
+                out.reader_ops as f64 / 1e3,
+                out.reclaimed,
             );
         }
     }

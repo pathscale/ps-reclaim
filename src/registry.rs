@@ -163,12 +163,19 @@ static LEASE: crate::tls::Tls<RefCell<Option<SlotLease>>> = crate::tls::Tls::new
 // same thing `thread_local!` lowers to: an address off the thread pointer, no
 // call, no key. Measured identical to `std` and roughly half the cost of
 // `pthread_getspecific`.
-#[cfg(all(not(feature = "std"), feature = "nightly"))]
+// unix only, and that restriction is load-bearing rather than caution.
+// `#[thread_local]` is scoped to the OS thread; the Windows `LEASE` below is an
+// `FlsAlloc` slot, scoped to the *fiber*, and its destructor runs on fiber
+// deletion. Pairing them lets a fiber return its slot to the registry while the
+// thread's cached `mine` still points at it, so a later fiber on that thread
+// pins through a registration another thread now owns. Having no `Drop` on
+// `Local` does not make that safe.
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[thread_local]
 static LOCAL: Local = Local::new();
 
 // Stable `no_std` has no way to say that, so it pays for a key.
-#[cfg(all(not(feature = "std"), not(feature = "nightly")))]
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 static LOCAL: crate::tls::Tls<Local> = crate::tls::Tls::new();
 
 /// Run `f` against this thread's `Local`, which is one lookup.
@@ -184,13 +191,13 @@ pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
 
 /// No lookup at all: the address is an offset from the thread pointer, and
 /// there is no lazy-init flag because `Local::new` is a `const` initialiser.
-#[cfg(all(not(feature = "std"), feature = "nightly"))]
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     f(&LOCAL)
 }
 
-#[cfg(all(not(feature = "std"), not(feature = "nightly")))]
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     LOCAL
