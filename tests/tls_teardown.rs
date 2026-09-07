@@ -18,7 +18,8 @@ impl Drop for LateReader {
         let other = Handle::new();
         drop(self.domain.pin_with(&other));
         self.domain.advance();
-        self.early_free.store(self.freed.load(Ordering::Acquire), Ordering::Release);
+        self.early_free
+            .store(self.freed.load(Ordering::Acquire), Ordering::Release);
     }
 }
 
@@ -39,12 +40,19 @@ fn a_guard_outliving_its_tls_lease_remains_visible() {
         LATE.with(|late| {
             let guard = domain.pin();
             let retired = Arc::clone(&reader_freed);
-            domain.retire(move || { retired.store(true, Ordering::Release); });
+            domain.retire(move || {
+                retired.store(true, Ordering::Release);
+            });
             *late.borrow_mut() = Some(LateReader {
-                domain, _guard: guard, freed: reader_freed, early_free: reader_early,
+                domain,
+                _guard: guard,
+                freed: reader_freed,
+                early_free: reader_early,
             });
         });
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
     assert!(!early_free.load(Ordering::Acquire));
     domain.advance();
     assert!(freed.load(Ordering::Acquire));
