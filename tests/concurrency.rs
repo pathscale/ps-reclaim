@@ -222,50 +222,6 @@ fn reclamation_progresses_under_continuous_readers() {
     assert_eq!(ran.load(Ordering::Acquire), RETIREMENTS);
 }
 
-/// More live threads than a thread has pin slots.
-///
-/// `PINS_PER_THREAD` is small and nesting past it falls back to a conservative
-/// wildcard pin, which is correct but holds *everything*. The fallback has to
-/// be safe and it has to be released, or one deeply nested reader stops the
-/// domain reclaiming for the rest of the process.
-#[test]
-fn nested_pins_past_the_slot_count_still_release() {
-    let domain = Domain::new();
-    let ran = Arc::new(AtomicUsize::new(0));
-
-    {
-        let a = domain.pin();
-        let b = domain.pin();
-        let c = domain.pin();
-        let d = domain.pin();
-        let e = domain.pin();
-        let f = domain.pin();
-        let counter = Arc::clone(&ran);
-        domain.retire(move || {
-            counter.fetch_add(1, Ordering::Release);
-        });
-        // Held: nothing may run.
-        domain.advance();
-        assert_eq!(ran.load(Ordering::Acquire), 0, "reclaimed under a live pin");
-        drop(f);
-        drop(e);
-        drop(d);
-        drop(c);
-        drop(b);
-        drop(a);
-    }
-
-    // Released: the wildcard must be gone, or this never drains.
-    for _ in 0..4 {
-        domain.advance();
-    }
-    assert_eq!(
-        ran.load(Ordering::Acquire),
-        1,
-        "a nested pin past the slot count did not release its wildcard"
-    );
-}
-
 /// A hole left by an out-of-order drop is reused without falling back to the
 /// process-wide wildcard. WorkTable nests its page and index domains on every
 /// select, so this is both a correctness property and a hot-path contract.

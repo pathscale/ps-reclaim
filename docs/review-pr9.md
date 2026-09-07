@@ -105,6 +105,9 @@ reuse after the normal pin has cleared.
 - Continuous-reader progress uses controlled overlapping handovers and asserts
   completion/backlog before releasing the last reader. Channel synchronization
   is intentional for this progress test, not weak-memory evidence.
+- Nested wildcard testing lives in a separate integration-test process so it
+  cannot stall unrelated progress assertions. It releases ordinary pins first,
+  leaving the overflow wildcard as the only protection of its distinct domain.
 - A real Windows no_std fiber test switches between separately pinned parent and
   child fibers, then deletes the quiescent child and repeats. It must actually
   run on Windows, both with and without the nightly feature.
