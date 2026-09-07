@@ -1,52 +1,13 @@
-//! `thread_local!` for a build that does not link `std`.
+//! Platform-owned TLS for builds without `std`.
 //!
-//! Compiled only when `std` is off. With `std` the crate keeps using
-//! `thread_local!` exactly as before.
+//! Unix values have pthread-key lifetime; Windows values have FLS (fiber)
+//! lifetime. The stable path stores the registration cache and lease together.
+//! Native Unix TLS uses a separate platform-key lease and explicitly closes
+//! the native cache before returning the registration. `get` never creates a
+//! value, so guard teardown cannot initialize a replacement cache.
 //!
-//! # What this costs, measured rather than assumed
-//!
-//! An earlier version of this comment said the `no_std` pin path is slower than
-//! the `std` one *by construction*. That was wrong twice over, and the
-//! correction is worth more than the original claim.
-//!
-//! It is wrong on this platform. On Mach-O, `std`'s thread-local is itself a
-//! call: both `#[thread_local]` and a `const`-initialised `thread_local!`
-//! compile at `-O` to five instructions ending in `blr x8`, through a TLV
-//! descriptor, before the variable is addressed. So both options here are a
-//! call and the only difference is which function you land in. Fifty million
-//! accesses each, three interleaved rounds on an M4 Max, with the same
-//! `thread_local!` arm measured twice per round as the null:
-//!
-//! ```text
-//!            thread_local!   pthread_getspecific   null (macro again)
-//!   round 1       1.71 ns              1.41 ns             1.19 ns
-//!   round 2       1.17 ns              1.40 ns             1.20 ns
-//!   round 3       1.19 ns              1.36 ns             1.16 ns
-//! ```
-//!
-//! The gap between the mechanisms is about 0.2 ns; the null moves by 0.5 on a
-//! bad round. There is no penalty here to speak of.
-//!
-//! It is also wrong in principle, which matters more, because it would have
-//! sent someone looking for a cleverer `Tls`. **The fast path is not gated on
-//! `std`, it is gated on the feature being stable.** `std`'s own fast path *is*
-//! `#[thread_local]`, in `sys/thread_local/native/`, and a `no_std` crate on
-//! nightly can write that attribute and get identical codegen. On ELF, where
-//! local-exec collapses to a register plus an offset, that is the whole win
-//! with no `std` involved. What `std` genuinely owns is the destructor
-//! plumbing: the weak `__cxa_thread_atexit_impl` lookup, Apple's `_tlv_atexit`,
-//! and the Windows `.CRT$XLB` callback, and even those are reachable through
-//! `libc`.
-//!
-//! # What actually costs, then
-//!
-//! The count, not the mechanism. Four thread-locals on the pin path is four
-//! calls at roughly 1.4 ns whichever mechanism is chosen, and three of the four
-//! values here have no destructor and could share one slot. Folding `MINE`,
-//! `SHARED` and `PIN_MASK` into a single struct is worth about 2.8 ns per pin,
-//! which is a larger number than anything in the table above. That is a change
-//! to the hot path of a lock-free crate and wants its own measurement, so it is
-//! not in the change that introduced this file.
+//! Access cost depends on target, linkage, optimizer and initialization path.
+//! Historical timings are not a performance guarantee; see docs/tls-cost.md.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -54,7 +15,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 extern crate alloc;
 use alloc::boxed::Box;
 
-/// One value of type `T` per thread.
+/// One value of type `T` per thread on Unix, per fiber on Windows.
 pub(crate) struct Tls<T> {
     /// The platform key, biased by one so that zero means "not yet created"
     /// and `new` stays a `const fn`. A `usize` holds either a `pthread_key_t`
@@ -63,7 +24,8 @@ pub(crate) struct Tls<T> {
     owns: PhantomData<fn() -> T>,
 }
 
-// SAFETY: the key is atomic, and every value behind it belongs to one thread.
+// SAFETY: the key is atomic; values are only accessed on the owning execution
+// context (thread on Unix, fiber on Windows).
 unsafe impl<T> Sync for Tls<T> {}
 
 #[cfg(unix)]
@@ -143,6 +105,23 @@ mod slot {
 }
 
 impl<T> Tls<T> {
+    /// Read an existing value without creating a key or invoking an initializer.
+    #[cfg(not(all(feature = "nightly", unix)))]
+    #[inline]
+    pub(crate) fn get<R>(&self, body: impl FnOnce(&T) -> R) -> Option<R> {
+        let biased = self.key.load(Ordering::Acquire);
+        if biased == 0 {
+            return None;
+        }
+        let existing = slot::get(biased - 1);
+        if existing.is_null() {
+            return None;
+        }
+        // SAFETY: the slot is thread/fiber-local, holds this T, and no user
+        // code runs between retrieving it and lending it to the closure.
+        Some(body(unsafe { &*existing.cast::<T>() }))
+    }
+
     pub(crate) const fn new() -> Self {
         Self {
             key: AtomicUsize::new(0),
@@ -180,10 +159,10 @@ impl<T> Tls<T> {
 
     /// Run `body` against this thread's value, creating it on first touch.
     ///
-    /// `None` means the slot could not be established, which is what
-    /// `thread_local!`'s `try_with` reports during thread teardown. Callers
-    /// have to tolerate it, and in this crate they do: a failure here loses a
-    /// cached lookup or leaks one slot, and never loses correctness.
+    /// `None` means storing a newly initialized value failed. Unlike std's
+    /// `try_with`, this is not a teardown detector: a later destructor may
+    /// initialize a new platform-key value. Registration ownership must handle
+    /// that case without recycling a slot that still has live pins.
     pub(crate) fn with<R>(
         &self,
         init: impl FnOnce() -> T,

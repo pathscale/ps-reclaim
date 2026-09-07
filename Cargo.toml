@@ -36,15 +36,18 @@ default = ["std"]
 #
 #     ps-reclaim = { version = "0.1", default-features = false, features = ["libc"] }
 #
-# `Mutex` and `OnceLock` become spins over `core` atomics, which is sound here
-# because neither is on the read path. See `src/sync.rs`.
+# `Mutex` and `OnceLock` become spins over `core` atomics. Neither is on the
+# steady-state read path; writer tail latency still needs measurement.
 std = []
 
-# Puts `Local` behind `#[thread_local]` instead of a platform key, which is
-# what `std` does internally and costs the same. Nightly-only because the
-# attribute is unstable, and sound here only because `Local` has no destructor:
-# `#[thread_local]` never runs one.
+# Native Unix TLS for the cache; its separately owned lease closes the cache
+# before recycling. Windows keeps both cache and lease in FLS, including with
+# this feature: a thread-local cache cannot safely borrow a per-fiber lease.
 nightly = []
+
+# Experimental isolation control: with std, change only the garbage-list
+# mutex, leaving TLS and the registry allocator unchanged. Not a speed claim.
+spin-garbage = ["spin"]
 
 [dev-dependencies]
 # Only to measure against what this replaces. Not a runtime dependency.

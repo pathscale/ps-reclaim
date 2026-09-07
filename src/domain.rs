@@ -1,6 +1,6 @@
-//! Th        if cratcore::mem::take(crate::sync::get_mut(&mut self.garbage))::sync::lock(&self.garbage).is_empty() { grace-period domain and its guard.
+//! Grace-period domains and their guards.
 
-use crate::sync::Mutex;
+use crate::sync::GarbageMutex as Mutex;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -11,6 +11,7 @@ use crate::registry::{
 };
 
 static NEXT_DOMAIN_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_EPOCH: u64 = u64::MAX >> DOMAIN_BITS;
 
 const _: () = assert!(PINS_PER_THREAD <= u8::BITS as usize);
 
@@ -23,16 +24,26 @@ fn pin_wildcard(participant: &Participant) -> usize {
 
 type Deferred = Box<dyn FnOnce() + Send + 'static>;
 
+struct Retirement {
+    sequence: u64,
+    epoch: u64,
+    run: Deferred,
+}
+
+struct Garbage {
+    next_sequence: u64,
+    entries: Vec<Retirement>,
+}
+
 /// One grace period.
 ///
-/// Readers of this domain never delay reclamation in another, so a slow scan
-/// over one structure cannot stall an unrelated one. A domain is a few words:
-/// the participant registry behind it is process-wide.
+/// Normal pins are domain-specific; wildcard overflow pins conservatively
+/// delay all domains. The participant registry is process-wide.
 pub struct Domain {
     id: u64,
     /// Advanced only by [`Domain::advance`], never on a read.
     epoch: AtomicU64,
-    garbage: Mutex<Vec<(u64, Deferred)>>,
+    garbage: Mutex<Garbage>,
 }
 
 impl Default for Domain {
@@ -58,25 +69,26 @@ impl Domain {
         Self {
             id: NEXT_DOMAIN_ID.fetch_add(1, Ordering::Relaxed),
             epoch: AtomicU64::new(1),
-            garbage: Mutex::new(Vec::new()),
+            garbage: Mutex::new(Garbage {
+                next_sequence: 0,
+                entries: Vec::new(),
+            }),
         }
     }
 
     /// Pin the calling thread into this domain.
     ///
     /// Hold the returned guard across every load and dereference of a pointer
-    /// this domain protects. Nothing retired before the pin is taken can be
-    /// reclaimed while it is held.
+    /// this domain protects. Pin before loading a protected pointer; a pin
+    /// cannot resurrect a pointer retired before the protected load.
     ///
-    /// The whole hot path: a thread-local read, a relaxed load of this
-    /// domain's epoch, one store into this thread's own cache line, and one
-    /// fence. No shared line is written.
+    /// After registration, a normal pin uses a thread-local read, a relaxed
+    /// epoch load, a store to its own padded slot, and a fence. Overflow pins
+    /// instead increment a wildcard counter, shared on registry overflow.
     #[inline]
     pub fn pin(&self) -> Guard<'_> {
         // One thread-local lookup for the whole pin. The participant, the
-        // shared-slot flag and the pin mask are three fields of one `Local`,
-        // and reading them through three separate lookups is what made the
-        // `no_std` build cost 22 to 40% of Arctic's burst throughput.
+        // shared-slot flag and the pin mask are fields of one `Local`.
         //
         // The order inside is exactly what it was when these were separate:
         // resolve the participant, then load the epoch, then claim an entry.
@@ -143,37 +155,55 @@ impl Domain {
         F: FnOnce() + Send + 'static,
     {
         let e = self.epoch.load(Ordering::Relaxed);
-        crate::sync::lock(&self.garbage).push((e, Box::new(f)));
+        let run: Deferred = Box::new(f);
+        let mut garbage = crate::sync::garbage_lock(&self.garbage);
+        let sequence = garbage.next_sequence;
+        // Never wrap: an old scan must not mistake new garbage for its batch.
+        garbage.next_sequence = sequence
+            .checked_add(1)
+            .expect("retirement sequence exhausted");
+        garbage.entries.push(Retirement {
+            sequence,
+            epoch: e,
+            run,
+        });
     }
 
     /// Retirements not yet run.
     ///
-    /// The only unbounded thing here: nothing drains without [`Self::advance`].
+    /// This queue can grow without bound unless reclamation is driven.
     pub fn pending(&self) -> usize {
-        crate::sync::lock(&self.garbage).len()
+        crate::sync::garbage_lock(&self.garbage).entries.len()
     }
 
-    /// Run every retirement whose grace period has expired, then advance the
-    /// epoch one step. Returns how many ran.
+    /// Run eligible retirements from a pre-scan snapshot. Returns how many ran.
+    /// A nonempty, non-wildcard-blocked scan advances the epoch, unless saturated.
     ///
     /// Never waits for readers, which is the property that matters and is not
     /// the same as never blocking: this takes the domain's own garbage lock,
     /// twice, so it is not lock-free. What it does not do is wait for a
     /// quiescent state. While a reader pinned before a retirement is still
     /// pinned, that retirement is simply not run yet. A reader that started
-    /// *after* it does not hold it up, which is what lets reclamation progress
-    /// under continuous read traffic.
+    /// in a later epoch does not hold it up. Readers in the retirement's
+    /// epoch conservatively delay it, even if they started after retirement.
     pub fn advance(&self) -> usize {
         self.advance_up_to(usize::MAX)
     }
 
-    /// Run at most `limit` retirements whose grace period has expired, then
-    /// advance the epoch one step. Returns how many ran.
+    /// Run at most `limit` eligible retirements with the same epoch progression
+    /// as [`Self::advance`]. A zero limit does nothing. Returns how many ran.
     ///
     /// This has the same reader-safety and non-blocking grace-period semantics
-    /// as [`Self::advance`], but bounds destructor work charged to the caller.
-    /// Eligible retirements beyond `limit` stay queued for a later pass.
+    /// as [`Self::advance`], but bounds the number of callbacks invoked.
+    /// Eligible retirements beyond `limit` stay queued for a later pass. This
+    /// does not bound scan time, allocation time, lock wait, or callback time.
     pub fn advance_up_to(&self, limit: usize) -> usize {
+        self.advance_with(limit, || ())
+    }
+
+    // The hook permits deterministic scheduling of the post-scan race in unit
+    // tests. The public path supplies a zero-sized no-op, with no runtime flag.
+    fn advance_with(&self, limit: usize, after_scan: impl FnOnce()) -> usize {
         if limit == 0 {
             return 0;
         }
@@ -186,9 +216,18 @@ impl Domain {
         // This matters because callers advance far more often than they
         // retire: WorkTable calls it on every mutation of a versioned page,
         // and the common case is that the previous call already drained.
-        if crate::sync::lock(&self.garbage).is_empty() {
-            return 0;
-        }
+        let cutoff = {
+            let garbage = crate::sync::garbage_lock(&self.garbage);
+            if garbage.entries.is_empty() {
+                return 0;
+            }
+            garbage.next_sequence
+        };
+
+        // The mutex orders every retirement below cutoff before this fence.
+        // Later retirements are excluded even if they have the same epoch.
+        // Concurrent scans may remove entries, so a Vec length is not a safe
+        // boundary; sequence numbers remain meaningful after such removals.
 
         // Paired with the fence in `pin`.
         fence(Ordering::SeqCst);
@@ -216,20 +255,22 @@ impl Domain {
             }
         }
 
+        after_scan();
         let expired: Vec<Deferred> = {
-            let mut garbage = crate::sync::lock(&self.garbage);
+            let mut garbage = crate::sync::garbage_lock(&self.garbage);
             // Strictly less than: something retired in the same epoch a reader
             // pinned in may still be reachable by that reader.
             //
             // `extract_if` drains in place. The previous `partition` moved the
             // whole queue into two fresh `Vec`s and wrote one back on every
             // call, so a domain holding a long backlog paid for the backlog on
-            // each advance even when nothing had expired. Retirements are
-            // pushed in epoch order, so this preserves order in both halves.
+            // each advance even when nothing had expired. Concurrent retire
+            // calls can sample epochs out of order; inspect each entry.
             garbage
-                .extract_if(.., |(e, _)| *e < min_pinned)
+                .entries
+                .extract_if(.., |r| r.sequence < cutoff && r.epoch < min_pinned)
                 .take(limit)
-                .map(|(_, f)| f)
+                .map(|r| r.run)
                 .collect()
         };
 
@@ -238,7 +279,11 @@ impl Domain {
         for f in expired {
             f();
         }
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        // Only 40 epoch bits fit in a published pin. Never wrap them: after
+        // saturation, reclamation conservatively requires a quiescent scan.
+        let _ = self.epoch.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+            Some(epoch.saturating_add(1).min(MAX_EPOCH))
+        });
         n
     }
 }
@@ -246,9 +291,9 @@ impl Domain {
 impl Drop for Domain {
     fn drop(&mut self) {
         // Exclusive access, so no reader can be pinned here.
-        let garbage = core::mem::take(crate::sync::get_mut(&mut self.garbage));
-        for (_, f) in garbage {
-            f();
+        let garbage = core::mem::take(&mut crate::sync::garbage_get_mut(&mut self.garbage).entries);
+        for retirement in garbage {
+            (retirement.run)();
         }
     }
 }
@@ -292,6 +337,7 @@ const _: () = assert!(align_of::<Participant>() > ENTRY_MASK);
 /// fn assert_send<T: Send>() {}
 /// assert_send::<ps_reclaim::Guard<'static>>();
 /// ```
+#[must_use = "a dropped guard no longer protects reader accesses"]
 pub struct Guard<'a> {
     /// The participant pointer, with this guard's pin entry in its low bits.
     ///
@@ -352,32 +398,54 @@ impl Drop for Guard<'_> {
                 // access this reader made while pinned.
                 p.pins[entry].store(NO_DOMAIN, Ordering::Release);
                 // The second and last thread-local lookup of a pin/unpin cycle.
-                crate::registry::with_local(|local| {
-                    let occupied = &local.pin_mask;
-                    occupied.set(occupied.get() & !(1_u8 << entry));
+                let _ = crate::registry::try_with_local(|local| {
+                    // A platform TLS destructor may have destroyed the old
+                    // Local and a later destructor may have registered afresh.
+                    // Never clear that new registration's occupancy bits.
+                    if local
+                        .mine
+                        .get()
+                        .is_some_and(|mine| core::ptr::eq(mine, p))
+                    {
+                        let occupied = &local.pin_mask;
+                        occupied.set(occupied.get() & !(1_u8 << entry));
+                    }
                 });
             }
         }
     }
 }
 
-/// A reader's registration, held by the caller instead of looked up.
+/// One caller-owned registration, reusable across every domain on a thread.
 ///
-/// This is the same idea `smr-swap` uses and it exists because of a
-/// measurement: after folding the pin path's thread-locals into one, a
-/// thread-local lookup was still the largest single component of a pin, ahead
-/// of the `SeqCst` fence. A lookup that cannot be made cheaper can be made
-/// unnecessary, by having the caller carry what the lookup would have found.
+/// Construct once outside the hot path and use [`Domain::pin_with`] for reads.
+/// Each live handle consumes one registry slot, regardless of domain count.
+/// Multiple handles and the implicit TLS registration consume separate slots;
+/// after 255 exclusive registrations, pins use the shared wildcard slot and
+/// delay reclamation in every domain. Prefer one handle per worker.
 ///
-/// The cost is ergonomic and it is real: a caller has to hold this and pass it
-/// down, which for a tree means threading it through the traversal. The benefit
-/// is that pinning touches no thread-local storage at all, on stable, with no
-/// platform assumptions.
+/// Both this registration and its guards are `!Send` and `!Sync`.
 ///
-/// `!Send` by construction. The participant slot behind a handle is this
-/// thread's alone and its `pins` entries are not safe to claim from two threads.
-pub struct Handle<'d> {
-    domain: &'d Domain,
+/// ```
+/// use ps_reclaim::{Domain, Handle};
+/// let registration = Handle::new();
+/// let a = Domain::new();
+/// let b = Domain::new();
+/// let first = a.pin_with(&registration);
+/// let second = b.pin_with(&registration);
+/// drop(first); // Out-of-order guard drops are supported.
+/// drop(second);
+/// ```
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<ps_reclaim::Handle>();
+/// ```
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<ps_reclaim::Handle>();
+/// ```
+pub struct Handle {
     participant: &'static Participant,
     shared: bool,
     /// The same mask `pin` keeps in thread-local storage, kept here instead.
@@ -386,16 +454,19 @@ pub struct Handle<'d> {
     _not_send: PhantomData<*const ()>,
 }
 
-impl Domain {
-    /// Take a registration for the calling thread.
-    ///
-    /// One registry acquisition, the same one the thread-local path does on
-    /// first pin. Hold it for as long as the thread reads, and pin through it.
-    pub fn handle(&self) -> Handle<'_> {
+impl Default for Handle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Handle {
+    /// Acquire one registry slot. This may lock and initialize the registry;
+    /// keep it outside latency-sensitive read loops.
+    pub fn new() -> Self {
         let registry = Registry::get();
         let (idx, shared) = registry.acquire();
         Handle {
-            domain: self,
             participant: &registry.slots[idx],
             shared,
             pin_mask: core::cell::Cell::new(0),
@@ -405,26 +476,46 @@ impl Domain {
     }
 }
 
-impl<'d> Handle<'d> {
-    /// Pin, with no thread-local lookup anywhere on the path.
+impl Domain {
+    /// Pin through a reusable registration without looking up TLS.
+    ///
+    /// The guard borrows both the domain and registration. It must cover every
+    /// protected pointer load and dereference, just as with [`Self::pin`].
+    ///
+    /// ```compile_fail
+    /// use ps_reclaim::{Domain, Handle};
+    /// let domain = Domain::new();
+    /// let registration = Handle::new();
+    /// let guard = domain.pin_with(&registration);
+    /// drop(registration);
+    /// drop(guard);
+    /// ```
+    /// ```compile_fail
+    /// use ps_reclaim::{Domain, Handle};
+    /// let domain = Domain::new();
+    /// let registration = Handle::new();
+    /// let guard = domain.pin_with(&registration);
+    /// drop(domain);
+    /// drop(guard);
+    /// ```
     #[inline]
-    pub fn pin(&self) -> HandleGuard<'_, 'd> {
-        let p = self.participant;
-        let e = self.domain.epoch.load(Ordering::Relaxed);
-        let packed = (e << DOMAIN_BITS) | (self.domain.id & DOMAIN_MASK);
-        let entry = if self.shared {
+    pub fn pin_with<'h, 'd>(&'d self, handle: &'h Handle) -> HandleGuard<'h, 'd> {
+        let p = handle.participant;
+        let e = self.epoch.load(Ordering::Relaxed);
+        let packed = (e << DOMAIN_BITS) | (self.id & DOMAIN_MASK);
+        let entry = if handle.shared {
             pin_wildcard(p)
         } else {
-            let mask = self.pin_mask.get();
+            let mask = handle.pin_mask.get();
             if mask == 0 {
                 p.pins[0].store(packed, Ordering::Relaxed);
-                self.pin_mask.set(1);
+                handle.pin_mask.set(1);
                 0
             } else {
                 let free = (!mask).trailing_zeros() as usize;
                 if free < PINS_PER_THREAD {
                     p.pins[free].store(packed, Ordering::Relaxed);
-                    self.pin_mask.set(mask | (1_u8 << free));
+                    handle.pin_mask.set(mask | (1_u8 << free));
                     free
                 } else {
                     pin_wildcard(p)
@@ -433,22 +524,38 @@ impl<'d> Handle<'d> {
         };
         fence(Ordering::SeqCst);
         HandleGuard {
-            handle: self,
+            handle,
             entry,
+            domain: PhantomData,
         }
     }
 }
 
-impl Drop for Handle<'_> {
+impl Drop for Handle {
     fn drop(&mut self) {
         drop(self.lease.take());
     }
 }
 
 /// A pin taken through a [`Handle`].
+///
+/// This is two words (registration reference and entry), unlike the packed
+/// one-word [`Guard`]. Benchmark returned read views as well as pin/drop loops
+/// before assuming their calling-convention costs are interchangeable.
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<ps_reclaim::HandleGuard<'static, 'static>>();
+/// ```
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<ps_reclaim::HandleGuard<'static, 'static>>();
+/// ```
+#[must_use = "a dropped guard no longer protects reader accesses"]
 pub struct HandleGuard<'h, 'd> {
-    handle: &'h Handle<'d>,
+    handle: &'h Handle,
     entry: usize,
+    domain: PhantomData<&'d Domain>,
 }
 
 impl Drop for HandleGuard<'_, '_> {
@@ -462,5 +569,53 @@ impl Drop for HandleGuard<'_, '_> {
             let m = &self.handle.pin_mask;
             m.set(m.get() & !(1_u8 << self.entry));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn saturated_epoch_still_protects_readers() {
+        let domain = Domain::new();
+        domain.epoch.store(MAX_EPOCH, Ordering::Relaxed);
+        let registration = Handle::new();
+        let guard = domain.pin_with(&registration);
+        let freed = Arc::new(AtomicBool::new(false));
+        let retired = Arc::clone(&freed);
+        domain.retire(move || retired.store(true, Ordering::Release));
+        for _ in 0..4 { domain.advance(); }
+        assert_eq!(domain.epoch.load(Ordering::Relaxed), MAX_EPOCH);
+        assert!(!freed.load(Ordering::Acquire));
+        drop(guard);
+        domain.advance();
+        assert!(freed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_post_scan_retirement_waits_for_its_reader() {
+        let domain = Domain::new();
+        let registration = Handle::new();
+        // Ensure the initial garbage check does not skip this scan.
+        domain.retire(|| ());
+        let freed = Arc::new(AtomicBool::new(false));
+        let held = RefCell::new(None);
+        domain.advance_with(usize::MAX, || {
+            // Deterministically enter after every participant was scanned.
+            let guard = domain.pin_with(&registration);
+            let freed = Arc::clone(&freed);
+            domain.retire(move || freed.store(true, Ordering::Release));
+            *held.borrow_mut() = Some(guard);
+        });
+        assert!(!freed.load(Ordering::Acquire));
+        domain.advance();
+        assert!(!freed.load(Ordering::Acquire));
+        drop(held.borrow_mut().take());
+        domain.advance();
+        assert!(freed.load(Ordering::Acquire));
     }
 }
