@@ -1,0 +1,110 @@
+name: Manual checks
+
+# Everything expensive, and nothing automatic. Run these from the Actions tab
+# when you are investigating something; they are not a gate on a push.
+#
+# `job` selects one, so you can run Miri without waiting on a feature matrix.
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Which check to run"
+        required: true
+        default: miri
+        type: choice
+        options: [miri, features, benches]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # A native test run cannot observe the reorderings this crate's correctness
+  # rests on. Miri can, and strict provenance is what rejects the integer round
+  # trip the packed guard was first written with. It takes seven minutes, which
+  # is why it is here rather than on every push.
+  miri:
+    if: inputs.job == 'miri'
+    name: Miri
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          add-job-id-key: "false"
+      # Two passes, because one test has to leak and the rest must not.
+      #
+      # `tests/tls_teardown.rs` needs a `&'static Domain` that outlives
+      # thread-local destructors, which only `Box::leak` gives it. That is a
+      # fixture leak, not a crate leak, and Miri's exit-time check cannot tell
+      # the difference. Turning leak checking off globally to accommodate it
+      # would throw away the signal that matters most here: this crate hands out
+      # registry slots and a leaked one is a real defect.
+      - name: Miri (strict provenance, leak-checked)
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: |
+          cargo miri test --lib \
+            --test concurrency \
+            --test contract \
+            --test handle_overflow \
+            --test handles \
+            --test overflow_slots
+      - name: Miri (teardown fixture, leaks ignored)
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-ignore-leaks
+        run: cargo miri test --test tls_teardown
+
+  # The configurations consumers actually select. One job that loops them,
+  # rather than a matrix that multiplies the runner count by four.
+  features:
+    if: inputs.job == 'features'
+    name: Feature matrix
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          add-job-id-key: "false"
+      # `inline-tsd` is included on purpose even though its fast path is aarch64
+      # macOS only: everywhere else it must fall back to the libc call and keep
+      # building, and this is what proves it.
+      - name: Build, test and lint each configuration
+        run: |
+          set -e
+          for args in \
+            "--no-default-features --features libc,spin" \
+            "--no-default-features --features libc,spin,spin-garbage" \
+            "--features spin-garbage" \
+            "--no-default-features --features libc,spin,inline-tsd" ; do
+            echo "=============== $args"
+            cargo build $args --verbose
+            cargo test $args --verbose
+            cargo clippy --lib --bins --tests $args -- -D warnings
+          done
+
+  # Compiles the benchmarks. Deliberately does not run them: a shared runner
+  # shares a core with whatever else is on the box, so any number it produced
+  # would be noise wearing a number's clothes.
+  benches:
+    if: inputs.job == 'benches'
+    name: Benchmarks compile
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          add-job-id-key: "false"
+      - name: Compile benches only
+        run: cargo build --benches --verbose
