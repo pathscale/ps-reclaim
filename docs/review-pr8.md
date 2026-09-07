@@ -78,6 +78,9 @@ mask if its participant still matches, avoiding damage to a recreated cache.
 ## Regression sources added, not executed
 
 - Deterministic post-scan retirement interleaving through a private no-op hook.
+- A channel-scheduled, two-thread regression with a published allocation and
+  actual destructor observation; the same test is supplied as a patch against
+  the exact pre-fix revision. See [the reproduction](repro/post-scan-race.md).
 - Epoch saturation with a held reader.
 - Saturated registration counter cannot reissue an exclusive slot.
 - One handle visiting 512 domains; overlapping and out-of-order guard drops.
