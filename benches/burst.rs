@@ -233,7 +233,9 @@ fn run(think: u32) -> [Measurements; 3] {
                     assert!(domain.advance() != 0, "quiescent reclamation stalled");
                 }
                 let cleanup_finish = Instant::now();
-                let cleanup_cpu = cleanup_cpu_start.zip(cpu()).map(|(a, b)| b.saturating_sub(a));
+                let cleanup_cpu = cleanup_cpu_start
+                    .zip(cpu())
+                    .map(|(a, b)| b.saturating_sub(a));
                 assert_eq!(reclaimed.load(Ordering::Relaxed), expected_reclaimed);
                 if round >= WARMUP_ROUNDS {
                     let result = &mut results[arm];
@@ -310,18 +312,27 @@ fn main() {
                 percentile(&result.latencies, 999).as_nanos(),
                 result.latencies.last().unwrap().as_nanos()
             );
-            let nanos = |value: Option<Duration>| value
-                .map(|duration| duration.as_nanos().to_string())
-                .unwrap_or_else(|| "n/a".to_owned());
+            let nanos = |value: Option<Duration>| {
+                value
+                    .map(|duration| duration.as_nanos().to_string())
+                    .unwrap_or_else(|| "n/a".to_owned())
+            };
             // Print only after run() has joined every worker, never between
             // measured arms. Sorting aggregate columns above does not change
             // these records or destroy the round/position pairing.
             for burst in &result.bursts {
                 println!(
                     "raw,{think},{},{},{name},{},{},{},{},{},{},{},{}",
-                    burst.round, burst.position, burst.drain.as_nanos(),
-                    nanos(burst.cpu), burst.reads, burst.reclaimed, burst.pending,
-                    burst.cleanup.as_nanos(), nanos(burst.cleanup_cpu), burst.complete.as_nanos(),
+                    burst.round,
+                    burst.position,
+                    burst.drain.as_nanos(),
+                    nanos(burst.cpu),
+                    burst.reads,
+                    burst.reclaimed,
+                    burst.pending,
+                    burst.cleanup.as_nanos(),
+                    nanos(burst.cleanup_cpu),
+                    burst.complete.as_nanos(),
                 );
             }
         }
