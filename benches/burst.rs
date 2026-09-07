@@ -9,11 +9,13 @@
 //! Per-update clock reads, start-barrier skew, scheduling, reader think loops,
 //! and allocation all remain part of the workload. Reader work is not fixed:
 //! report its count, and do not call process CPU a cost-per-identical-operation.
-//! Final quiescent garbage draining is checked but outside the timed window.
+//! Report timed callback counts, residual garbage and separately timed final
+//! cleanup. Raw per-round rows preserve pairing; no predictability claim follows
+//! from matching TLS controls or from the pooled synthetic latency percentiles.
 
 use std::hint::black_box;
-use std::sync::{Arc, Barrier, mpsc};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 use ps_reclaim::{Domain, Handle};
@@ -28,9 +30,14 @@ const RETIRE_EVERY: usize = 64;
 const WARMUP_ROUNDS: usize = 6;
 const ROUNDS: usize = 24;
 const ORDERS: [[usize; 3]; 6] = [
-    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
 ];
-const _: () = assert!(UPDATES % WRITERS == 0);
+const _: () = assert!(UPDATES.is_multiple_of(WRITERS));
 
 #[cfg(unix)]
 fn cpu() -> Option<Duration> {
@@ -40,14 +47,14 @@ fn cpu() -> Option<Duration> {
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
         return None;
     }
-    let part = |t: libc::timeval| {
-        Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1_000)
-    };
+    let part = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1_000);
     Some(part(usage.ru_utime) + part(usage.ru_stime))
 }
 
 #[cfg(not(unix))]
-fn cpu() -> Option<Duration> { None }
+fn cpu() -> Option<Duration> {
+    None
+}
 
 struct WriterJob {
     explicit: bool,
@@ -65,6 +72,20 @@ struct Measurements {
     cpus: Vec<Duration>,
     reads: Vec<u64>,
     latencies: Vec<Duration>,
+    bursts: Vec<Burst>,
+}
+
+struct Burst {
+    round: usize,
+    position: usize,
+    drain: Duration,
+    cpu: Option<Duration>,
+    reads: u64,
+    reclaimed: usize,
+    pending: usize,
+    cleanup: Duration,
+    cleanup_cpu: Option<Duration>,
+    complete: Duration,
 }
 
 fn run(think: u32) -> [Measurements; 3] {
@@ -104,7 +125,9 @@ fn run(think: u32) -> [Measurements; 3] {
                             black_box(&guard);
                         }
                         count += 1;
-                        for _ in 0..think { core::hint::spin_loop(); }
+                        for _ in 0..think {
+                            core::hint::spin_loop();
+                        }
                     }
                     black_box(acc);
                     report.send(count).unwrap();
@@ -153,7 +176,12 @@ fn run(think: u32) -> [Measurements; 3] {
                         job.samples.push(at.elapsed());
                     }
                     let finished = Instant::now();
-                    report.send(WriterReport { finished, samples: job.samples }).unwrap();
+                    report
+                        .send(WriterReport {
+                            finished,
+                            samples: job.samples,
+                        })
+                        .unwrap();
                 }
             });
             writers.push((jobs, reports, Vec::with_capacity(PER_WRITER)));
@@ -161,13 +189,17 @@ fn run(think: u32) -> [Measurements; 3] {
 
         let mut expected_reclaimed = 0;
         for round in 0..WARMUP_ROUNDS + ROUNDS {
-            for arm in ORDERS[round % ORDERS.len()] {
+            for (position, arm) in ORDERS[round % ORDERS.len()].into_iter().enumerate() {
                 stop.store(false, Ordering::Relaxed);
-                for (jobs, _) in &readers { jobs.send(arm == 1).unwrap(); }
+                for (jobs, _) in &readers {
+                    jobs.send(arm == 1).unwrap();
+                }
                 for (jobs, _, samples) in &mut writers {
                     jobs.send(WriterJob {
-                        explicit: arm == 1, samples: core::mem::take(samples),
-                    }).unwrap();
+                        explicit: arm == 1,
+                        samples: core::mem::take(samples),
+                    })
+                    .unwrap();
                 }
                 ready.wait();
                 let before_cpu = cpu();
@@ -180,19 +212,50 @@ fn run(think: u32) -> [Measurements; 3] {
                     *samples = report.samples;
                 }
                 stop.store(true, Ordering::Relaxed);
-                let reads: u64 = readers.iter().map(|(_, report)| report.recv().unwrap()).sum();
+                let reads: u64 = readers
+                    .iter()
+                    .map(|(_, report)| report.recv().unwrap())
+                    .sum();
                 // CPU covers release through reader shutdown, not just the
                 // drain. Capture before aggregation and quiescent reclamation.
                 let used_cpu = before_cpu.zip(cpu()).map(|(a, b)| b.saturating_sub(a));
-                expected_reclaimed += WRITERS * (PER_WRITER / RETIRE_EVERY);
+                // Only writers run callbacks before here, and all their finish
+                // reports have arrived. These counts therefore describe work
+                // completed by the last writer, not the later quiescent drain.
+                let timed_reclaimed = reclaimed.load(Ordering::Relaxed) - expected_reclaimed;
+                let pending = domain.pending();
+                let retired = WRITERS * (PER_WRITER / RETIRE_EVERY);
+                assert_eq!(timed_reclaimed + pending, retired);
+                expected_reclaimed += retired;
+                let cleanup_cpu_start = cpu();
+                let cleanup_start = Instant::now();
                 while domain.pending() != 0 {
                     assert!(domain.advance() != 0, "quiescent reclamation stalled");
                 }
+                let cleanup_finish = Instant::now();
+                let cleanup_cpu = cleanup_cpu_start
+                    .zip(cpu())
+                    .map(|(a, b)| b.saturating_sub(a));
                 assert_eq!(reclaimed.load(Ordering::Relaxed), expected_reclaimed);
                 if round >= WARMUP_ROUNDS {
                     let result = &mut results[arm];
-                    result.drains.push(finished.duration_since(started));
-                    if let Some(cpu) = used_cpu { result.cpus.push(cpu); }
+                    let drain = finished.duration_since(started);
+                    result.drains.push(drain);
+                    result.bursts.push(Burst {
+                        round: round - WARMUP_ROUNDS,
+                        position,
+                        drain,
+                        cpu: used_cpu,
+                        reads,
+                        reclaimed: timed_reclaimed,
+                        pending,
+                        cleanup: cleanup_finish.duration_since(cleanup_start),
+                        cleanup_cpu,
+                        complete: cleanup_finish.duration_since(started),
+                    });
+                    if let Some(cpu) = used_cpu {
+                        result.cpus.push(cpu);
+                    }
                     result.reads.push(reads);
                     for (_, _, samples) in &writers {
                         result.latencies.extend_from_slice(samples);
@@ -215,13 +278,21 @@ fn percentile(sorted: &[Duration], per_mille: usize) -> Duration {
 
 fn main() {
     println!("{UPDATES} updates/burst; {WRITERS} persistent writers, {READERS} readers");
-    println!("{WARMUP_ROUNDS} warmup + {ROUNDS} measured rounds; counterbalanced TLS/handle/TLS control");
-    println!("60 retirements/burst; advance_up_to(8) after each retirement; final drain excluded");
+    println!(
+        "{WARMUP_ROUNDS} warmup + {ROUNDS} measured rounds; counterbalanced TLS/handle/TLS control"
+    );
+    println!("60 retirements/burst; advance_up_to(8); report timed callbacks and separate cleanup");
     println!("CPU: release through reader shutdown; drain: release through last writer timestamp");
     println!("No affinity control; sampled update times include clocks and periodic reclamation.");
+    println!("complete includes reader shutdown, observer accounting and final reclamation.");
+    println!(
+        "raw,think,round,position,arm,drain_ns,cpu_ns,reads,reclaimed,pending,cleanup_ns,cleanup_cpu_ns,complete_ns"
+    );
     for think in [0u32, 100, 1_000, 10_000] {
         println!("\nreader think: {think} spin_loop iterations");
-        println!("arm             Mupdates/s  drain us  CPU ms  reads/burst   p50 ns   p99 ns p99.9 ns   max ns");
+        println!(
+            "arm             Mupdates/s  drain us  CPU ms  reads/burst   p50 ns   p99 ns p99.9 ns   max ns"
+        );
         for (name, mut result) in ["TLS", "handle", "TLS control"].into_iter().zip(run(think)) {
             result.drains.sort_unstable();
             result.cpus.sort_unstable();
@@ -233,14 +304,39 @@ fn main() {
             } else {
                 format!("{:.3}", percentile(&result.cpus, 500).as_secs_f64() * 1e3)
             };
-            println!("{name:<15} {:>10.3} {:>9.3} {cpu:>7} {:>12} {:>8} {:>8} {:>8} {:>8}",
+            println!(
+                "{name:<15} {:>10.3} {:>9.3} {cpu:>7} {:>12} {:>8} {:>8} {:>8} {:>8}",
                 UPDATES as f64 / drain.as_secs_f64() / 1e6,
                 drain.as_secs_f64() * 1e6,
                 result.reads[result.reads.len() / 2],
                 percentile(&result.latencies, 500).as_nanos(),
                 percentile(&result.latencies, 990).as_nanos(),
                 percentile(&result.latencies, 999).as_nanos(),
-                result.latencies.last().unwrap().as_nanos());
+                result.latencies.last().unwrap().as_nanos()
+            );
+            let nanos = |value: Option<Duration>| {
+                value
+                    .map(|duration| duration.as_nanos().to_string())
+                    .unwrap_or_else(|| "n/a".to_owned())
+            };
+            // Print only after run() has joined every worker, never between
+            // measured arms. Sorting aggregate columns above does not change
+            // these records or destroy the round/position pairing.
+            for burst in &result.bursts {
+                println!(
+                    "raw,{think},{},{},{name},{},{},{},{},{},{},{},{}",
+                    burst.round,
+                    burst.position,
+                    burst.drain.as_nanos(),
+                    nanos(burst.cpu),
+                    burst.reads,
+                    burst.reclaimed,
+                    burst.pending,
+                    burst.cleanup.as_nanos(),
+                    nanos(burst.cleanup_cpu),
+                    burst.complete.as_nanos(),
+                );
+            }
         }
     }
 }
