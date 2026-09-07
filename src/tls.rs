@@ -56,7 +56,39 @@ mod slot {
         // the process.
         let rc = unsafe { libc::pthread_key_create(&raw mut fresh, Some(drop)) };
         assert_eq!(rc, 0, "pthread_key_create");
-        fresh as usize
+        let key = fresh as usize;
+
+        // The inline read below rests on an undocumented layout, and CI runs on
+        // Linux so it will never exercise this path. That leaves one place to
+        // catch a layout change, and this is it: prove the inline read and the
+        // libc call agree on a sentinel, once per key, before anything relies
+        // on either.
+        //
+        // Deliberately not a `debug_assert`. Reading the wrong slot is silent
+        // memory corruption, so a release build is exactly where this must
+        // still fire. Cost is one store, two loads and a store, once per key
+        // per process.
+        #[cfg(all(feature = "inline-tsd", target_arch = "aarch64", target_os = "macos"))]
+        {
+            let sentinel = &raw const fresh as *mut c_void;
+            // SAFETY: `key` was just created and holds no value on this thread,
+            // so the sentinel cannot displace anything, and it is cleared below.
+            let stored = unsafe { libc::pthread_setspecific(fresh, sentinel) == 0 };
+            assert!(stored, "pthread_setspecific while checking the TSD layout");
+            let inlined = get(key);
+            // SAFETY: as above.
+            let via_libc = unsafe { libc::pthread_getspecific(fresh) };
+            // SAFETY: as above; puts the slot back the way it was found.
+            unsafe { libc::pthread_setspecific(fresh, core::ptr::null_mut()) };
+            assert_eq!(
+                inlined, via_libc,
+                "the inline TSD read disagrees with pthread_getspecific: the \
+                 thread-local layout this build assumes is not the one this \
+                 platform uses. Rebuild without the `inline-tsd` feature."
+            );
+        }
+
+        key
     }
 
     #[cfg(unix)]
@@ -65,7 +97,50 @@ mod slot {
         unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) };
     }
 
-    #[cfg(unix)]
+    /// Read this thread's slot.
+    ///
+    /// `pthread_getspecific` is not slow because the work is expensive. On
+    /// Darwin aarch64 it is a read of the thread pointer, a mask of the low
+    /// three bits, and an indexed load. It is slow because it is an opaque
+    /// `extern "C"` call: the optimiser must assume it can touch any memory,
+    /// so it cannot hoist it, cannot common two reads of the same key, and
+    /// must spill around it.
+    ///
+    /// So where the layout is known, do that load inline and let the optimiser
+    /// see it. The key still comes from `pthread_key_create`, so the slot is a
+    /// real TSD slot and its destructor still runs at thread exit; only the
+    /// read changes.
+    ///
+    /// **This is an undocumented ABI.** Apple does not promise the TSD layout,
+    /// even though its own libpthread inlines exactly this. Hence the feature,
+    /// which is off by default, and the narrow target gate: everything else
+    /// keeps the call.
+    #[cfg(all(
+        unix,
+        feature = "inline-tsd",
+        target_arch = "aarch64",
+        target_os = "macos"
+    ))]
+    #[inline(always)]
+    pub(super) fn get(key: usize) -> *mut c_void {
+        let thread_pointer: usize;
+        // SAFETY: reading the thread pointer has no side effects and touches
+        // no memory. The low three bits are reserved and masked off, and `key`
+        // came from `pthread_key_create`, so the slot it indexes is in range.
+        unsafe {
+            core::arch::asm!(
+                "mrs {}, tpidrro_el0",
+                out(reg) thread_pointer,
+                options(nomem, nostack, preserves_flags)
+            );
+            *((thread_pointer & !7usize) as *const *mut c_void).add(key)
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(all(feature = "inline-tsd", target_arch = "aarch64", target_os = "macos"))
+    ))]
     pub(super) fn get(key: usize) -> *mut c_void {
         // SAFETY: `key` came from `create` and is valid process-wide.
         unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }
