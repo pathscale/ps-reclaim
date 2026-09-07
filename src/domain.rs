@@ -138,13 +138,13 @@ impl Domain {
                 let occupied = &local.pin_mask;
                 let mask = occupied.get();
                 if mask == 0 {
-                    p.pins[0].store(packed, Ordering::Release);
+                    p.pins[0].store(packed, Ordering::Relaxed);
                     occupied.set(1);
                     0
                 } else {
                     let free = (!mask).trailing_zeros() as usize;
                     if free < PINS_PER_THREAD {
-                        p.pins[free].store(packed, Ordering::Release);
+                        p.pins[free].store(packed, Ordering::Relaxed);
                         occupied.set(mask | (1_u8 << free));
                         free
                     } else {
@@ -582,13 +582,13 @@ impl Domain {
         } else {
             let mask = handle.pin_mask.get();
             if mask == 0 {
-                p.pins[0].store(packed, Ordering::Release);
+                p.pins[0].store(packed, Ordering::Relaxed);
                 handle.pin_mask.set(1);
                 0
             } else {
                 let free = (!mask).trailing_zeros() as usize;
                 if free < PINS_PER_THREAD {
-                    p.pins[free].store(packed, Ordering::Release);
+                    p.pins[free].store(packed, Ordering::Relaxed);
                     handle.pin_mask.set(mask | (1_u8 << free));
                     free
                 } else {
