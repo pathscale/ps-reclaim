@@ -22,7 +22,9 @@ unsafe extern "system" fn child(parameter: *mut c_void) {
     let state = unsafe { &*parameter.cast::<State>() };
     let guard = state.domain.pin();
     let freed = Arc::clone(&state.freed);
-    state.domain.retire(move || freed.store(true, Ordering::Release));
+    state
+        .domain
+        .retire(move || freed.store(true, Ordering::Release));
     state.stage.set(1);
     // SAFETY: parent names the suspended parent fiber on this same OS thread.
     unsafe { SwitchToFiber(state.parent) };
