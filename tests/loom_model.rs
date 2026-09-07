@@ -1,5 +1,7 @@
 #![cfg(ps_loom)]
-//! The reader/reclaimer handshake, explored exhaustively by loom.
+//! The small reader/reclaimer handshake model inherited from PR #7.
+//! Exploration is limited by Loom's model and any configured bounds. Changes
+//! in the PR #9 follow-up are source-only, not executed validation.
 //!
 //! This models the protocol, not the crate. Retrofitting loom onto ps-reclaim
 //! means routing every atomic through one module and then dealing with `static`
@@ -43,30 +45,30 @@ fn run(pin_fence: bool, scan_fence: bool) {
         let d = Arc::clone(&d);
         thread::spawn(move || {
             let e = d.epoch.load(Ordering::Relaxed);
-            d.pin.store(e, Ordering::Relaxed);
+            d.pin.store(e, Ordering::Release);
             if pin_fence {
                 fence(Ordering::SeqCst);
             }
-            if d.published.load(Ordering::Relaxed) == 1 {
+            if d.published.load(Ordering::Acquire) == 1 {
                 assert_eq!(
                     d.object.load(Ordering::Relaxed),
                     1,
                     "read an object that had already been reclaimed"
                 );
             }
-            d.pin.store(NO_DOMAIN, Ordering::Relaxed);
+            d.pin.store(NO_DOMAIN, Ordering::Release);
         })
     };
 
     let writer = {
         let d = Arc::clone(&d);
         thread::spawn(move || {
-            d.published.store(0, Ordering::Relaxed);
+            d.published.store(0, Ordering::Release);
             let retired_at = d.epoch.load(Ordering::Relaxed);
             if scan_fence {
                 fence(Ordering::SeqCst);
             }
-            let pinned = d.pin.load(Ordering::Relaxed);
+            let pinned = d.pin.load(Ordering::Acquire);
             if pinned == NO_DOMAIN || pinned > retired_at {
                 d.object.store(0, Ordering::Relaxed);
             }

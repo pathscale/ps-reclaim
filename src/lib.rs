@@ -15,7 +15,9 @@
 //!
 //! 2. **Readers in later epochs do not delay older retirements.** Readers in
 //!    the same epoch can delay them. Wildcard pins delay all reclamation, and
-//!    at epoch saturation reclamation requires a quiescent scan.
+//!    at epoch saturation new retirements require a quiescent scan. Monitor
+//!    [`Domain::epoch_headroom`] and renew with exclusive domain access before
+//!    saturation; this does not transparently solve rollover for active readers.
 //!
 //! 3. **Reclamation is driven, not incidental.** [`Domain::advance`] is the
 //!    explicit driver (along with `advance_up_to`); dropping a domain also
@@ -55,7 +57,7 @@ mod domain;
 mod registry;
 
 pub use domain::{Domain, Guard, Handle, HandleGuard};
-pub use registry::slots_handed_out;
+pub use registry::{RegistryStats, registry_stats, slots_handed_out};
 
 /// Registry capacity, including one shared overflow slot.
 ///

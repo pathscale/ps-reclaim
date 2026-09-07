@@ -12,7 +12,13 @@ on:
         required: true
         default: miri
         type: choice
-        options: [miri, features, benches]
+        options: [miri, features, platforms, benches, loom]
+      platform:
+        description: "Runner for the platforms check (one runner per dispatch)"
+        required: true
+        default: windows-latest
+        type: choice
+        options: [windows-latest, macos-latest]
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,12 +27,11 @@ permissions:
   contents: read
 
 jobs:
-  # A native test run cannot observe the reorderings this crate's correctness
-  # rests on. Miri can, and strict provenance is what rejects the integer round
-  # trip the packed guard was first written with. It takes seven minutes, which
-  # is why it is here rather than on every push.
+  # Miri checks exercised executions/provenance, not all weak-memory behavior.
+  # All branch gates below require removal after authorization to compile the
+  # source-only follow-up. Nothing here runs automatically or was dispatched.
   miri:
-    if: inputs.job == 'miri'
+    if: inputs.job == 'miri' && github.ref_name != 'fix/reclaim-review'
     name: Miri
     runs-on: ubicloud-standard-2
     timeout-minutes: 45
@@ -39,38 +44,26 @@ jobs:
         with:
           cache-on-failure: "true"
           add-job-id-key: "false"
-      # Two passes, because one test has to leak and the rest must not.
-      #
-      # `tests/tls_teardown.rs` needs a `&'static Domain` that outlives
-      # thread-local destructors, which only `Box::leak` gives it. That is a
-      # fixture leak, not a crate leak, and Miri's exit-time check cannot tell
-      # the difference. Turning leak checking off globally to accommodate it
-      # would throw away the signal that matters most here: this crate hands out
-      # registry slots and a leaked one is a real defect.
+      # The teardown fixture now has a static owner; no ignore-leaks exception.
+      # Capacity assertions are separate: a globally rooted registry can lose
+      # free-list indices without leaking an allocation.
       - name: Miri (strict provenance, leak-checked)
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
-        run: |
-          cargo miri test --lib \
-            --test concurrency \
-            --test contract \
-            --test handle_overflow \
-            --test handles \
-            --test overflow_slots
-      - name: Miri (teardown fixture, leaks ignored)
-        env:
-          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-ignore-leaks
-        run: cargo miri test --test tls_teardown
+        run: cargo miri test --lib --tests
 
   # The configurations consumers actually select. One job that loops them,
   # rather than a matrix that multiplies the runner count by four.
   features:
-    if: inputs.job == 'features'
+    if: inputs.job == 'features' && github.ref_name != 'fix/reclaim-review'
     name: Feature matrix
     runs-on: ubicloud-standard-2
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: "true"
@@ -91,12 +84,79 @@ jobs:
             cargo test $args --verbose
             cargo clippy --lib --bins --tests $args -- -D warnings
           done
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - name: Native Unix TLS and its teardown
+        run: |
+          cargo +nightly check --lib --no-default-features --features libc,spin,nightly
+          cargo +nightly test --no-default-features --features libc,spin,nightly
+          cargo +nightly clippy --lib --tests --no-default-features --features libc,spin,nightly -- -D warnings
+
+  # Explicit platform selection, not an automatic multi-runner matrix. Actual
+  # Windows fiber switching and Darwin inline TSD need runtime target coverage.
+  platforms:
+    if: inputs.job == 'platforms' && github.ref_name != 'fix/reclaim-review'
+    name: Platform runtime checks
+    runs-on: ${{ inputs.platform }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Stable platform configurations
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = Windows ]; then
+            configurations=("" "--no-default-features --features windows-sys,spin")
+          else
+            test "$(uname -m)" = arm64
+            configurations=("--no-default-features --features libc,spin" "--no-default-features --features libc,spin,inline-tsd")
+          fi
+          for args in "${configurations[@]}"; do
+            cargo +stable check --lib $args
+            cargo +stable test $args
+            cargo +stable clippy --lib --tests $args -- -D warnings
+          done
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - name: Nightly feature with native Unix TLS or Windows FLS
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = Windows ]; then
+            features=windows-sys,spin,nightly
+          else
+            features=libc,spin,nightly
+          fi
+          cargo +nightly check --lib --no-default-features --features "$features"
+          cargo +nightly test --no-default-features --features "$features"
+          cargo +nightly clippy --lib --tests --no-default-features --features "$features" -- -D warnings
+
+  loom:
+    if: inputs.job == 'loom' && github.ref_name != 'fix/reclaim-review'
+    name: Reduced models (not full-crate proof)
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Handshake and bounded registration/repin/reclaimer model
+        env:
+          RUSTFLAGS: --cfg ps_loom
+        run: cargo test --test loom_model --test loom_protocol
 
   # Compiles the benchmarks. Deliberately does not run them: a shared runner
   # shares a core with whatever else is on the box, so any number it produced
   # would be noise wearing a number's clothes.
   benches:
-    if: inputs.job == 'benches'
+    if: inputs.job == 'benches' && github.ref_name != 'fix/reclaim-review'
     name: Benchmarks compile
     runs-on: ubicloud-standard-2
     timeout-minutes: 20
