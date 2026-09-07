@@ -1,7 +1,7 @@
 # PR #9: whole-source audit follow-up
 
 Source-only, best effort. Based on PR #7 head
-`2827b65fab7a769811372176f0233b49322e467b` on `perf/handle-api`, which already
+`09846ecb8fa76092d31aa468809cc1d6481f5a2f` on `perf/handle-api`, which already
 contains the earlier PR #8 work. The existing `fix/reclaim-review` branch was
 advanced to the initial parent and rebased again as PR #7 advanced; inherited
 work is not duplicated. The parent formatting, validation fixes, manual-only
