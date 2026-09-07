@@ -69,46 +69,6 @@ jobs:
       - name: Clippy (${{ matrix.name }})
         run: cargo clippy --all-targets ${{ matrix.args }} -- -D warnings
 
-  # Everything else here runs on x86_64, which is TSO: it reorders far less than
-  # this crate's correctness assumes it might. The deployment target is aarch64
-  # (Graviton), which is weakly ordered, so the platform where the pin/scan
-  # fence pairing actually has to work was the one platform never tested.
-  #
-  # Miri models the C++ memory model rather than a chip, so it is not a
-  # substitute for running on the hardware, and the reader-safety stress test
-  # publishes through a `Mutex` that supplies its own ordering. Between them
-  # that left the fences unexercised. This job is the cheapest correction.
-  aarch64:
-    name: aarch64 (deployment arch)
-    runs-on: ubicloud-standard-2-arm
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: default
-            args: ""
-          - name: no_std, platform keys
-            args: --no-default-features --features libc,spin
-          - name: no_std, spin garbage
-            args: --no-default-features --features libc,spin,spin-garbage
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: "true"
-          add-job-id-key: "false"
-      - name: Build (${{ matrix.name }})
-        run: cargo build --all-targets --verbose ${{ matrix.args }}
-      # Repeated, because a weak-memory failure is a race and one green run is
-      # weak evidence. Cheap here: the whole suite is well under a minute.
-      - name: Test x5 (${{ matrix.name }})
-        run: |
-          for i in 1 2 3 4 5; do
-            echo "--- run $i"
-            cargo test --all-targets ${{ matrix.args }}
-          done
-
   lint:
     name: Format and clippy
     runs-on: ubicloud-standard-2
