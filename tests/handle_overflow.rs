@@ -11,7 +11,9 @@ fn independent_overflow_handles_share_a_count_not_a_pin() {
     let second = domain.pin_with(&handles[MAX_THREADS + 1]);
     let hits = Arc::new(AtomicUsize::new(0));
     let retired = Arc::clone(&hits);
-    domain.retire(move || { retired.fetch_add(1, Ordering::Release); });
+    domain.retire(move || {
+        retired.fetch_add(1, Ordering::Release);
+    });
     drop(first);
     domain.advance();
     assert_eq!(hits.load(Ordering::Acquire), 0);

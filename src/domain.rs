@@ -402,11 +402,7 @@ impl Drop for Guard<'_> {
                     // A platform TLS destructor may have destroyed the old
                     // Local and a later destructor may have registered afresh.
                     // Never clear that new registration's occupancy bits.
-                    if local
-                        .mine
-                        .get()
-                        .is_some_and(|mine| core::ptr::eq(mine, p))
-                    {
+                    if local.mine.get().is_some_and(|mine| core::ptr::eq(mine, p)) {
                         let occupied = &local.pin_mask;
                         occupied.set(occupied.get() & !(1_u8 << entry));
                     }

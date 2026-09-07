@@ -4,14 +4,16 @@
 //! with the immediate-progress assertions in other suites.
 
 use ps_reclaim::{Domain, Handle, MAX_NESTED_PINS};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn retire_counter(domain: &Domain, count: &Arc<AtomicUsize>) {
     let count = Arc::clone(count);
-    domain.retire(move || { count.fetch_add(1, Ordering::Release); });
+    domain.retire(move || {
+        count.fetch_add(1, Ordering::Release);
+    });
 }
 
 #[test]
@@ -36,7 +38,9 @@ fn one_registration_covers_many_domains_and_out_of_order_guards() {
     assert_eq!(hits.load(Ordering::Acquire), 0);
     drop(second);
     drop(replacement);
-    for _ in 0..64 { domains[1].advance(); }
+    for _ in 0..64 {
+        domains[1].advance();
+    }
     assert_eq!(hits.load(Ordering::Acquire), 1);
 }
 
@@ -53,7 +57,9 @@ fn tls_and_explicit_pins_protect_independently() {
     domain.advance();
     assert_eq!(hits.load(Ordering::Acquire), 0);
     drop(implicit);
-    for _ in 0..64 { domain.advance(); }
+    for _ in 0..64 {
+        domain.advance();
+    }
     assert_eq!(hits.load(Ordering::Acquire), 1);
 }
 
@@ -84,7 +90,8 @@ fn nested_wildcard_and_unwind_release_protection() {
     let hits = Arc::new(AtomicUsize::new(0));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let guards: Vec<_> = (0..=MAX_NESTED_PINS)
-            .map(|_| domain.pin_with(&registration)).collect();
+            .map(|_| domain.pin_with(&registration))
+            .collect();
         retire_counter(&domain, &hits);
         domain.advance();
         assert_eq!(hits.load(Ordering::Acquire), 0);
@@ -92,6 +99,8 @@ fn nested_wildcard_and_unwind_release_protection() {
         panic!("exercise guard unwinding");
     }));
     assert!(result.is_err());
-    for _ in 0..64 { domain.advance(); }
+    for _ in 0..64 {
+        domain.advance();
+    }
     assert_eq!(hits.load(Ordering::Acquire), 1);
 }
