@@ -1,5 +1,13 @@
 # Checking this crate before you put it on a feed
 
+Baseline report for PR #7 before the PR #9 source-only follow-up. Preserve the
+measurements below as historical evidence, not validation of the new source.
+PR #9 changes the queue, quarantine recovery, test isolation, fixture lifetime,
+model coverage and manual workflow commands. Its new sources have NOT been run;
+see [the current follow-up notes](review-pr9.md) for coverage and limitations.
+In particular, registration-capacity loss is not detected by Miri's allocation
+leak check, and the new static-owned teardown fixture needs no ignore-leaks flag.
+
 What to run before deploying, what each check proves, and — more usefully —
 what each one does not. Nothing here runs in CI: CI builds, tests and lints, and
 everything below is deliberately manual, because these are questions you ask
