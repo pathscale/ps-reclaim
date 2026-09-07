@@ -13,20 +13,18 @@
 //! 1. **A retirement is not run while any reader that predates it is live.**
 //!    The obvious one. Without it, use-after-free.
 //!
-//! 2. **A reader that starts *after* a retirement does not delay it.** This is
-//!    the one that separates schemes. Under continuous read traffic there may
-//!    never be an instant with zero readers, and a scheme that waits for one
-//!    never reclaims anything at all. Reference-counted schemes (`seize`, and
-//!    a plain global reader counter) do not provide this; epoch schemes do.
+//! 2. **Readers in later epochs do not delay older retirements.** Readers in
+//!    the same epoch can delay them. Wildcard pins delay all reclamation, and
+//!    at epoch saturation reclamation requires a quiescent scan.
 //!
 //! 3. **Reclamation is driven, not incidental.** [`Domain::advance`] is the
-//!    only thing that runs retirements. Nothing happens on the read path, so
-//!    a read never pays for someone else's garbage.
+//!    explicit driver (along with `advance_up_to`); dropping a domain also
+//!    runs its remaining retirements. Read-side unpin never runs callbacks.
 //!
 //! # What a domain is
 //!
-//! One grace period. Readers of domain A never delay reclamation in domain B,
-//! so a slow scan over one table cannot stall another. Domains are cheap: a
+//! One grace period. Normal pins are domain-specific; overflow wildcard pins
+//! delay every domain. Packed domain-ID collisions are conservative. Domains are a
 //! few words, because the participant registry is process-wide rather than
 //! per-domain. That matters when there is a domain per table and a thousand
 //! tables.
@@ -34,22 +32,16 @@
 //! # Cost
 //!
 //! The read path publishes into the calling thread's own padded slot and
-//! fences. No shared cache line is written, so it does not degrade as readers
-//! are added. `benches/pin.rs` measures it against `crossbeam-epoch` and
-//! `seize`; run it before changing anything here.
+//! fences. Normal pins do not write another reader's cache line; overflow
+//! pins share a counter. This is not a bounded-latency guarantee for writers:
+//! retirement and advancement take locks and may allocate.
 
 // `not(test)` so the harness keeps its own prelude while the library under test
 // is the `no_std` one. `cargo check --no-default-features` is what proves the
 // library does not link `std`, since a test binary cannot.
-// `#[thread_local]` is the same mechanism `thread_local!` lowers to, and a
-// `no_std` crate can write it directly. Measured on an M4 Max, 20M accesses
-// each behind `#[inline(never)]`: `thread_local!` 1.21 ns, `#[thread_local]`
-// 1.23 ns, `pthread_getspecific` 2.15 ns. Identical to `std`, without `std`.
-//
-// The usual objection is that it does not run destructors. `Local` has none:
-// it is three `Cell`s of `Copy` types. `LEASE` does have one and stays on a
-// platform key, which is fine because it is not on the pin path.
-#![cfg_attr(feature = "nightly", feature(thread_local))]
+// Native no_std TLS is Unix-only: a platform-key lease closes its cache at
+// teardown. Windows keeps cache and lease together in FLS (fiber lifetime).
+#![cfg_attr(all(not(feature = "std"), feature = "nightly", unix), feature(thread_local))]
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(missing_docs)]
 
@@ -65,13 +57,14 @@ mod registry;
 pub use domain::{Domain, Guard, Handle, HandleGuard};
 pub use registry::slots_handed_out;
 
-/// Upper bound on threads holding pins at once.
+/// Registry capacity, including one shared overflow slot.
 ///
-/// Past it, threads share the last slot: correct, because a shared pin only
-/// ever delays reclamation, never permits it early, but contended.
+/// Each live `Handle` and each implicit TLS registration uses a slot. After
+/// 255 exclusive registrations, pins share the last slot and delay reclamation
+/// in all domains. It is not a bound on the number of OS threads.
 pub const MAX_THREADS: usize = registry::MAX_THREADS;
 
-/// Domains one thread can be pinned in simultaneously.
+/// Normal simultaneous pins per registration (including repeated domains).
 ///
 /// Past it a thread publishes a wildcard and is treated as pinned everywhere
 /// until it releases: conservative, never unsound.

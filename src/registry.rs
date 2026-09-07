@@ -1,6 +1,6 @@
 //! Process-wide participant registry.
 //!
-//! Threads register once and pubish *which domains* they are pinned in. The
+//! Threads register once and publish *which domains* they are pinned in. The
 //! registry is shared across every domain rather than owned by each, because
 //! there is a domain per table and a per-domain array would cost megabytes at
 //! a thousand tables.
@@ -17,7 +17,8 @@ pub(crate) const MAX_THREADS: usize = 256;
 /// See [`crate::MAX_NESTED_PINS`].
 pub(crate) const PINS_PER_THREAD: usize = 4;
 
-/// Empty pin entry. Domain ids start at 1, so zero is unambiguous.
+/// Empty pin entry. Published epochs start at 1 and never wrap, so a packed
+/// pin is nonzero even if its truncated domain ID is zero.
 pub(crate) const NO_DOMAIN: u64 = 0;
 
 /// Bits of a packed entry given to the domain id, leaving 40 for the epoch.
@@ -79,7 +80,11 @@ impl Registry {
         if let Some(idx) = crate::sync::lock(&self.free).pop() {
             return (idx, false);
         }
-        let idx = self.next.fetch_add(1, Ordering::Relaxed);
+        // Keep the diagnostic counter monotonic even on long-lived 32-bit
+        // targets. Wrapping could hand out an exclusive slot still in use.
+        let idx = self.next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        }).unwrap_or(usize::MAX);
         if idx < MAX_THREADS - 1 {
             (idx, false)
         } else {
@@ -97,10 +102,15 @@ impl Registry {
             return;
         }
         let p = &self.slots[idx];
-        for pin in &p.pins {
-            pin.store(NO_DOMAIN, Ordering::Release);
+        // A guard may outlive the TLS lease in another TLS destructor, or be
+        // forgotten through safe code. Never erase such a pin to recycle its
+        // slot. Leaking the registration in this exceptional case is safer
+        // than permitting a new owner to overwrite a still-live reader.
+        if p.wildcard.load(Ordering::Acquire) != 0
+            || p.pins.iter().any(|pin| pin.load(Ordering::Acquire) != NO_DOMAIN)
+        {
+            return;
         }
-        p.wildcard.store(0, Ordering::Release);
         crate::sync::lock(&self.free).push(idx);
     }
 }
@@ -116,19 +126,11 @@ impl Drop for SlotLease {
 
 /// This thread's per-thread state, in one place.
 ///
-/// It was three separate thread-locals, and `pin` touched all three while
-/// `Guard::drop` touched a fourth. That is four lookups per pin/unpin cycle,
-/// which is free where a thread-local is a register offset and is not free
-/// where it is a `pthread_getspecific` call. Measured on the burst benchmark,
-/// the `no_std` build lost 22 to 40% of Arctic's throughput to exactly this.
-///
-/// None of the three has a destructor, and they are nine bytes between them.
-/// One lookup in `pin` and one in `drop` costs half of what four did, and the
-/// grouping is honest: these three are read together, always.
+/// The cache has no destructor. Its owner closes it before releasing the slot;
+/// one lookup in `pin` and one in `drop` access the related fields together.
 pub(crate) struct Local {
     /// Cached so the read path touches neither the `OnceLock` nor the slot
-    /// `Vec`. Doing both on pin and unpin measured four times the cost of the
-    /// pin itself.
+    /// `Vec` after registration.
     pub(crate) mine: Cell<Option<&'static Participant>>,
     /// Whether this thread shares the overflow slot, and so must pin through
     /// the wildcard rather than through `pins`.
@@ -136,6 +138,7 @@ pub(crate) struct Local {
     /// Occupied entries in this thread's participant slot. Guards are `!Send`,
     /// so this is exact rather than a hint and handles out-of-order drops.
     pub(crate) pin_mask: Cell<u8>,
+    closed: Cell<bool>,
 }
 
 impl Local {
@@ -144,32 +147,75 @@ impl Local {
             mine: Cell::new(None),
             shared: Cell::new(false),
             pin_mask: Cell::new(0),
+            closed: Cell::new(false),
         }
     }
+
+    fn close(&self) {
+        self.closed.set(true);
+        self.mine.set(None);
+    }
 }
+
+// Native Local has no destructor. Close its cache before returning the lease.
+// The hot cache remains available during later TLS destructors, but attempting
+// to register through it again is rejected on the cold path.
+#[cfg(any(feature = "std", all(feature = "nightly", unix)))]
+struct ThreadLease {
+    _lease: SlotLease,
+}
+
+#[cfg(any(feature = "std", all(feature = "nightly", unix)))]
+impl Drop for ThreadLease {
+    fn drop(&mut self) {
+        let _ = try_with_local(Local::close);
+    }
+}
+
 #[cfg(feature = "std")]
 thread_local! {
     static LOCAL: Local = const { Local::new() };
-    static LEASE: RefCell<Option<SlotLease>> = const { RefCell::new(None) };
+    static LEASE: RefCell<Option<ThreadLease>> = const { RefCell::new(None) };
 }
 
 // Without `std`, `LEASE` is a platform key because it has a destructor that
 // has to run at thread exit. That is the one thing `#[thread_local]` cannot do
 // and the one thing a platform key is genuinely needed for here.
-#[cfg(not(feature = "std"))]
-static LEASE: crate::tls::Tls<RefCell<Option<SlotLease>>> = crate::tls::Tls::new();
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+static LEASE: crate::tls::Tls<RefCell<Option<ThreadLease>>> = crate::tls::Tls::new();
 
 // `Local` is the hot one and it has no destructor, so on nightly it can be the
-// same thing `thread_local!` lowers to: an address off the thread pointer, no
-// call, no key. Measured identical to `std` and roughly half the cost of
-// `pthread_getspecific`.
-#[cfg(all(not(feature = "std"), feature = "nightly"))]
+// native TLS cache. Generated access costs depend on the target and linkage;
+// the platform-key lease is only accessed on registration and teardown.
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[thread_local]
 static LOCAL: Local = Local::new();
 
-// Stable `no_std` has no way to say that, so it pays for a key.
-#[cfg(all(not(feature = "std"), not(feature = "nightly")))]
-static LOCAL: crate::tls::Tls<Local> = crate::tls::Tls::new();
+// On Windows, FLS lifetime is a fiber's lifetime, not a thread's. Keep both
+// cache and owner in the same FLS object, including when nightly is enabled.
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+struct OwnedLocal {
+    local: Local,
+    lease: RefCell<Option<SlotLease>>,
+}
+
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+impl OwnedLocal {
+    fn new() -> Self {
+        Self { local: Local::new(), lease: RefCell::new(None) }
+    }
+}
+
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+impl Drop for OwnedLocal {
+    fn drop(&mut self) {
+        self.local.close();
+        // `lease` is dropped after the cache is closed.
+    }
+}
+
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+static LOCAL: crate::tls::Tls<OwnedLocal> = crate::tls::Tls::new();
 
 /// Run `f` against this thread's `Local`, which is one lookup.
 ///
@@ -182,37 +228,60 @@ pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     LOCAL.with(f)
 }
 
-/// No lookup at all: the address is an offset from the thread pointer, and
-/// there is no lazy-init flag because `Local::new` is a `const` initialiser.
-#[cfg(all(not(feature = "std"), feature = "nightly"))]
+/// Native TLS cache access; the generated addressing sequence is target-specific.
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     f(&LOCAL)
 }
 
-#[cfg(all(not(feature = "std"), not(feature = "nightly")))]
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     LOCAL
-        .with(Local::new, f)
-        .expect("thread-local storage is gone during teardown")
+        .with(OwnedLocal::new, |owned| f(&owned.local))
+        .expect("cannot initialize platform-local registration storage")
 }
 
 /// Install this thread's lease, whose `Drop` returns the slot at thread exit.
 ///
-/// Failure is tolerated on purpose, which is why this returns nothing: losing
-/// the lease during teardown leaks one slot rather than recycling it, and
-/// `acquire` is bounded rather than fallible for exactly that reason.
+/// Publish the cached participant only if installation succeeds. A rejected
+/// installation drops the lease and returns the unused slot, not a stale cache.
 #[cfg(feature = "std")]
 #[inline]
-fn install_lease(lease: SlotLease) {
-    let _ = LEASE.try_with(|l| *l.borrow_mut() = Some(lease));
+fn install_lease(lease: SlotLease) -> bool {
+    LEASE.try_with(|l| *l.borrow_mut() = Some(ThreadLease { _lease: lease })).is_ok()
 }
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
 #[inline]
-fn install_lease(lease: SlotLease) {
-    let _ = LEASE.with(|| RefCell::new(None), |l| *l.borrow_mut() = Some(lease));
+fn install_lease(lease: SlotLease) -> bool {
+    LEASE.with(|| RefCell::new(None), |l| *l.borrow_mut() = Some(ThreadLease { _lease: lease })).is_some()
+}
+
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+fn install_lease(lease: SlotLease) -> bool {
+    LOCAL.get(|owned| *owned.lease.borrow_mut() = Some(lease)).is_some()
+}
+
+/// Access only an existing Local. Guard destruction must not initialize a new
+/// registration during TLS teardown.
+#[cfg(feature = "std")]
+#[inline]
+pub(crate) fn try_with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
+    LOCAL.try_with(f).ok()
+}
+
+#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+#[inline]
+pub(crate) fn try_with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
+    Some(f(&LOCAL))
+}
+
+#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[inline]
+pub(crate) fn try_with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
+    LOCAL.get(|owned| f(&owned.local))
 }
 
 /// This thread's participant slot, given a `Local` the caller already holds.
@@ -230,20 +299,18 @@ pub(crate) fn participant_in(local: &Local) -> &'static Participant {
 /// First touch on this thread: take a slot and remember it.
 ///
 /// Split out and marked cold so the branch above stays a load and a null test.
-/// It reaches the registry mutex, which is the one place this crate takes a
-/// lock, and it happens once per thread.
+/// It reaches the registry mutex, outside the steady-state read path.
 #[cold]
 #[inline(never)]
 fn register(local: &Local) -> &'static Participant {
+    assert!(!local.closed.get(), "cannot pin after registration teardown");
     let registry = Registry::get();
     let (idx, shared) = registry.acquire();
     let p = &registry.slots[idx];
+    // Install ownership before publishing a cache that readers can use.
+    assert!(install_lease(SlotLease(idx, shared)), "cannot install registration during teardown");
     local.mine.set(Some(p));
     local.shared.set(shared);
-    // Installed separately so its `Drop` runs at thread exit. Failing during
-    // TLS teardown leaks one slot rather than recycling it, which is why
-    // `acquire` is bounded rather than fallible.
-    install_lease(SlotLease(idx, shared));
     p
 }
 
@@ -251,10 +318,10 @@ fn register(local: &Local) -> &'static Participant {
 ///
 /// `release` returns an index to the free list without lowering this, so a
 /// process that started and joined many threads reads high while few are live.
-/// That is deliberate and it is what the diagnostic wants: past
-/// [`MAX_THREADS`] every further thread shares the last slot, which is sound
-/// but contended, and only the high-water mark shows that happened at all. A
-/// live count would fall back to a flat number afterwards and hide it.
+/// Once exclusive capacity is reached, acquisition uses returned free slots
+/// first, otherwise the shared wildcard slot. This counter includes overflow
+/// acquisition attempts, but not free-list reuse, and saturates at usize::MAX.
+/// It is neither a live-registration count nor a literal count of unique slots.
 ///
 /// It was called `slots_in_use`, which said the opposite of what it returns.
 pub fn slots_handed_out() -> usize {
@@ -280,5 +347,23 @@ impl Registry {
     pub(crate) fn active_slots(&self) -> &[Participant] {
         let leased = self.next.load(Ordering::Relaxed).min(MAX_THREADS);
         &self.slots[..leased]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saturated_registration_counter_never_reissues_an_exclusive_slot() {
+        let registry = Registry {
+            slots: (0..MAX_THREADS).map(|_| Participant::new()).collect(),
+            free: Mutex::new(Vec::new()),
+            next: AtomicUsize::new(usize::MAX),
+        };
+        for _ in 0..3 {
+            assert_eq!(registry.acquire(), (MAX_THREADS - 1, true));
+        }
+        assert_eq!(registry.next.load(Ordering::Relaxed), usize::MAX);
     }
 }

@@ -5,13 +5,12 @@
 //! unchanged, so the default build is what it was and blocks in the kernel
 //! under contention exactly as before. Without `std` they come from `spin`.
 //!
-//! The difference is not cosmetic: a `std` mutex sleeps a waiter, and a spin
-//! mutex burns a core until the holder releases. That is acceptable here only
-//! because of what these guard. The free list is a `Vec<usize>` touched once
-//! per thread lifetime, and the garbage list is touched on retire. **Neither is
-//! on the read path**, which is the whole point of this crate. A spin around a
-//! critical section that short and that rare is fine; a spin on the pin path
-//! would not be, and there is none.
+//! A spin mutex burns CPU while waiting, including when its holder is
+//! descheduled. Neither mutex is on the steady-state read path, but garbage
+//! extraction scans a potentially unbounded backlog and may allocate under
+//! the lock. No bounded writer-latency guarantee follows from short pins.
+//! `spin-garbage` changes only the garbage mutex in a std build, permitting an
+//! isolated experiment without simultaneously changing TLS or registration.
 //!
 //! `spin` rather than something written here, because a spin lock and a
 //! once-cell are exactly the kind of small unsafe primitive that looks obvious
@@ -23,6 +22,35 @@ pub(crate) use std::sync::{Mutex, OnceLock};
 
 #[cfg(not(feature = "std"))]
 pub(crate) use spin::{Mutex, Once as OnceLock};
+
+#[cfg(all(feature = "std", not(feature = "spin-garbage")))]
+pub(crate) use std::sync::Mutex as GarbageMutex;
+#[cfg(any(not(feature = "std"), feature = "spin-garbage"))]
+pub(crate) use spin::Mutex as GarbageMutex;
+
+#[cfg(all(feature = "std", not(feature = "spin-garbage")))]
+#[inline]
+pub(crate) fn garbage_lock<T>(mutex: &GarbageMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(any(not(feature = "std"), feature = "spin-garbage"))]
+#[inline]
+pub(crate) fn garbage_lock<T>(mutex: &GarbageMutex<T>) -> spin::MutexGuard<'_, T> {
+    mutex.lock()
+}
+
+#[cfg(all(feature = "std", not(feature = "spin-garbage")))]
+#[inline]
+pub(crate) fn garbage_get_mut<T>(mutex: &mut GarbageMutex<T>) -> &mut T {
+    mutex.get_mut().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(any(not(feature = "std"), feature = "spin-garbage"))]
+#[inline]
+pub(crate) fn garbage_get_mut<T>(mutex: &mut GarbageMutex<T>) -> &mut T {
+    mutex.get_mut()
+}
 
 /// Lock, recovering from poisoning where the concept exists.
 ///
@@ -41,20 +69,6 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[inline]
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> spin::MutexGuard<'_, T> {
     mutex.lock()
-}
-
-/// Unique access to the contents, for a caller that already has `&mut` and
-/// should not pay for a lock at all.
-#[cfg(feature = "std")]
-#[inline]
-pub(crate) fn get_mut<T>(mutex: &mut Mutex<T>) -> &mut T {
-    mutex.get_mut().unwrap_or_else(|e| e.into_inner())
-}
-
-#[cfg(not(feature = "std"))]
-#[inline]
-pub(crate) fn get_mut<T>(mutex: &mut Mutex<T>) -> &mut T {
-    mutex.get_mut()
 }
 
 /// Initialise once, then read forever.

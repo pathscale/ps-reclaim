@@ -1,223 +1,246 @@
-//! What a thread-local lookup costs a pin, under a burst rather than in a loop.
+//! Synthetic pinned book updates, not an HFT latency certification.
 //!
-//! # Why this exists, and why it is not `benches/pin.rs`
+//! Persistent workers warm both registrations before timing. A ready barrier
+//! excludes setup, a start barrier releases all workers, and the last writer's
+//! completion timestamp ends the drain metric. TLS/handle/TLS-control order is
+//! counterbalanced across all six permutations. Every 64th writer update
+//! retires an owned allocation and drives a bounded-callback reclamation pass.
 //!
-//! `pin.rs` measures a pin in a tight loop. That is the right shape for
-//! comparing reclamation schemes and the wrong one for comparing *lookup
-//! mechanisms*, because a loop lets the optimiser hoist a `thread_local!`
-//! address out of it and never lets it hoist an opaque `pthread_getspecific`.
-//! Measured that way, the answer is a statement about the optimiser.
-//!
-//! This is the burst shape a market-data feed produces, deliberately the same
-//! as `parking_lot_lite_hack`'s `benches/burst.rs` so the two read against each
-//! other: 200 symbols by 20 levels rewritten per burst, four writers each
-//! owning a contiguous shard, four readers querying throughout, twenty bursts.
-//! What decides whether a feed keeps up is how fast a burst drains and how bad
-//! the worst update in it is, so that is what is reported.
-//!
-//! # The two arms
-//!
-//! Identical in every respect but the pin: same sharding, same key order, same
-//! counts, same latency sampling, same branch. One pins through `Domain::pin`,
-//! which finds this thread's registration in thread-local storage; the other
-//! through a `Handle`, which was handed it. **Whatever they differ by is what
-//! the lookup costs**, and that depends entirely on the build:
-//!
-//! ```text
-//! cargo bench --bench burst
-//! cargo bench --bench burst --no-default-features --features libc,spin
-//! ```
-//!
-//! With `std` a thread-local is an offset from the thread pointer and the two
-//! arms are the same, so the handle is not worth its API cost. Without `std` it
-//! is a `pthread_getspecific` call and the handle is roughly twice the
-//! throughput at a third of the CPU.
-//!
-//! The book is a flat `Vec<AtomicU64>`, not a map: these arms are not measuring
-//! a data structure. Every read and every write happens under a pin, which is
-//! the traffic being measured, with a retirement every 64 updates so the
-//! reclaimer runs rather than idles.
+//! Per-update clock reads, start-barrier skew, scheduling, reader think loops,
+//! and allocation all remain part of the workload. Reader work is not fixed:
+//! report its count, and do not call process CPU a cost-per-identical-operation.
+//! Final quiescent garbage draining is checked but outside the timed window.
 
 use std::hint::black_box;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use ps_reclaim::Domain;
+use ps_reclaim::{Domain, Handle};
 
-/// Symbols on the feed.
-const SYMBOLS: u64 = 200;
-/// Book levels rewritten per symbol per burst.
-const LEVELS: u64 = 20;
-/// Threads delivering the burst. Deliberately short of the core count: at one
-/// thread per core the harness has no headroom and the arms drift by more than
-/// they differ.
+const SYMBOLS: usize = 200;
+const LEVELS: usize = 20;
 const WRITERS: usize = 4;
-/// Consumers querying throughout.
 const READERS: usize = 4;
-const BURSTS: usize = 20;
+const UPDATES: usize = SYMBOLS * LEVELS;
+const PER_WRITER: usize = UPDATES / WRITERS;
+const RETIRE_EVERY: usize = 64;
+const WARMUP_ROUNDS: usize = 6;
+const ROUNDS: usize = 24;
+const ORDERS: [[usize; 3]; 6] = [
+    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+];
+const _: () = assert!(UPDATES % WRITERS == 0);
 
-fn cpu() -> Duration {
-    // SAFETY: `getrusage` fills the `rusage` for `RUSAGE_SELF` or returns
-    // non-zero without writing.
+#[cfg(unix)]
+fn cpu() -> Option<Duration> {
+    // SAFETY: zero is a valid initial representation, and getrusage writes
+    // through a valid pointer. Only consume its result on success.
     let mut usage: libc::rusage = unsafe { core::mem::zeroed() };
-    assert_eq!(
-        unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) },
-        0
-    );
-    let part =
-        |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32).saturating_mul(1_000));
-    part(usage.ru_utime) + part(usage.ru_stime)
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) } != 0 {
+        return None;
+    }
+    let part = |t: libc::timeval| {
+        Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1_000)
+    };
+    Some(part(usage.ru_utime) + part(usage.ru_stime))
 }
 
-/// One burst. `use_handle` picks how a pin finds this thread's registration.
-///
-/// The branch sits inside the loop rather than outside it so that both arms pay
-/// it. It is perfectly predicted and identical in each, which is the point: the
-/// only thing that differs between the arms is the pin.
-fn burst(think: u32, use_handle: bool) -> (Duration, Duration, Vec<Duration>) {
-    let domain: &'static Domain = Box::leak(Box::new(Domain::new()));
-    let book: Arc<Vec<AtomicU64>> = Arc::new((0..SYMBOLS * LEVELS).map(AtomicU64::new).collect());
-    let stop = Arc::new(AtomicBool::new(false));
-    let samples = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+#[cfg(not(unix))]
+fn cpu() -> Option<Duration> { None }
 
-    let before = cpu();
-    let started = Instant::now();
+struct WriterJob {
+    explicit: bool,
+    samples: Vec<Duration>,
+}
+
+struct WriterReport {
+    finished: Instant,
+    samples: Vec<Duration>,
+}
+
+#[derive(Default)]
+struct Measurements {
+    drains: Vec<Duration>,
+    cpus: Vec<Duration>,
+    reads: Vec<u64>,
+    latencies: Vec<Duration>,
+}
+
+fn run(think: u32) -> [Measurements; 3] {
+    let domain = Domain::new();
+    let book: Vec<_> = (0..UPDATES as u64).map(AtomicU64::new).collect();
+    let stop = AtomicBool::new(false);
+    let ready = Barrier::new(READERS + WRITERS + 1);
+    let go = Barrier::new(READERS + WRITERS + 1);
+    let reclaimed = Arc::new(AtomicUsize::new(0));
+    let mut results: [Measurements; 3] = std::array::from_fn(|_| Measurements::default());
+
     std::thread::scope(|scope| {
+        let mut readers = Vec::new();
         for _ in 0..READERS {
-            let book = Arc::clone(&book);
-            let stop = Arc::clone(&stop);
+            let (jobs, receive) = mpsc::channel::<bool>();
+            let (report, reports) = mpsc::channel();
+            let (domain, book, stop, ready, go) = (&domain, &book, &stop, &ready, &go);
             scope.spawn(move || {
-                let handle = if use_handle {
-                    Some(domain.handle())
-                } else {
-                    None
-                };
-                let mut acc = 0u64;
-                let mut key = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    key = key.wrapping_add(2_654_435_761) % (SYMBOLS * LEVELS);
-                    if let Some(h) = &handle {
-                        let g = h.pin();
-                        acc ^= book[key as usize].load(Ordering::Relaxed);
-                        black_box(&g);
-                    } else {
-                        let g = domain.pin();
-                        acc ^= book[key as usize].load(Ordering::Relaxed);
-                        black_box(&g);
+                let handle = Handle::new();
+                drop(domain.pin());
+                drop(domain.pin_with(&handle));
+                while let Ok(explicit) = receive.recv() {
+                    let mut key = 0usize;
+                    let mut acc = 0u64;
+                    let mut count = 0u64;
+                    ready.wait();
+                    go.wait();
+                    while !stop.load(Ordering::Relaxed) {
+                        key = key.wrapping_add(2_654_435_761) % UPDATES;
+                        if explicit {
+                            let guard = domain.pin_with(&handle);
+                            acc ^= book[key].load(Ordering::Relaxed);
+                            black_box(&guard);
+                        } else {
+                            let guard = domain.pin();
+                            acc ^= book[key].load(Ordering::Relaxed);
+                            black_box(&guard);
+                        }
+                        count += 1;
+                        for _ in 0..think { core::hint::spin_loop(); }
                     }
-                    for _ in 0..think {
-                        core::hint::spin_loop();
+                    black_box(acc);
+                    report.send(count).unwrap();
+                }
+            });
+            readers.push((jobs, reports));
+        }
+
+        let mut writers = Vec::new();
+        for writer in 0..WRITERS {
+            let (jobs, receive) = mpsc::channel::<WriterJob>();
+            let (report, reports) = mpsc::channel();
+            let (domain, book, ready, go) = (&domain, &book, &ready, &go);
+            let reclaimed = Arc::clone(&reclaimed);
+            scope.spawn(move || {
+                let handle = Handle::new();
+                drop(domain.pin());
+                drop(domain.pin_with(&handle));
+                while let Ok(mut job) = receive.recv() {
+                    job.samples.clear();
+                    ready.wait();
+                    go.wait();
+                    for offset in 0..PER_WRITER {
+                        let key = writer * PER_WRITER + offset;
+                        let at = Instant::now();
+                        if job.explicit {
+                            let guard = domain.pin_with(&handle);
+                            book[key].store((key as u64).wrapping_mul(31), Ordering::Relaxed);
+                            black_box(&guard);
+                        } else {
+                            let guard = domain.pin();
+                            book[key].store((key as u64).wrapping_mul(31), Ordering::Relaxed);
+                            black_box(&guard);
+                        }
+                        if (offset + 1) % RETIRE_EVERY == 0 {
+                            // This payload is never published to readers: it
+                            // exercises ownership/destruction, not pointer safety.
+                            let payload = Box::new([key as u64; 8]);
+                            let reclaimed = Arc::clone(&reclaimed);
+                            domain.retire(move || {
+                                drop(black_box(payload));
+                                reclaimed.fetch_add(1, Ordering::Relaxed);
+                            });
+                            domain.advance_up_to(8);
+                        }
+                        job.samples.push(at.elapsed());
+                    }
+                    let finished = Instant::now();
+                    report.send(WriterReport { finished, samples: job.samples }).unwrap();
+                }
+            });
+            writers.push((jobs, reports, Vec::with_capacity(PER_WRITER)));
+        }
+
+        let mut expected_reclaimed = 0;
+        for round in 0..WARMUP_ROUNDS + ROUNDS {
+            for arm in ORDERS[round % ORDERS.len()] {
+                stop.store(false, Ordering::Relaxed);
+                for (jobs, _) in &readers { jobs.send(arm == 1).unwrap(); }
+                for (jobs, _, samples) in &mut writers {
+                    jobs.send(WriterJob {
+                        explicit: arm == 1, samples: core::mem::take(samples),
+                    }).unwrap();
+                }
+                ready.wait();
+                let before_cpu = cpu();
+                let started = Instant::now();
+                go.wait();
+                let mut finished = started;
+                for (_, reports, samples) in &mut writers {
+                    let report = reports.recv().unwrap();
+                    finished = finished.max(report.finished);
+                    *samples = report.samples;
+                }
+                stop.store(true, Ordering::Relaxed);
+                let reads: u64 = readers.iter().map(|(_, report)| report.recv().unwrap()).sum();
+                // CPU covers release through reader shutdown, not just the
+                // drain. Capture before aggregation and quiescent reclamation.
+                let used_cpu = before_cpu.zip(cpu()).map(|(a, b)| b.saturating_sub(a));
+                expected_reclaimed += WRITERS * (PER_WRITER / RETIRE_EVERY);
+                while domain.pending() != 0 {
+                    assert!(domain.advance() != 0, "quiescent reclamation stalled");
+                }
+                assert_eq!(reclaimed.load(Ordering::Relaxed), expected_reclaimed);
+                if round >= WARMUP_ROUNDS {
+                    let result = &mut results[arm];
+                    result.drains.push(finished.duration_since(started));
+                    if let Some(cpu) = used_cpu { result.cpus.push(cpu); }
+                    result.reads.push(reads);
+                    for (_, _, samples) in &writers {
+                        result.latencies.extend_from_slice(samples);
                     }
                 }
-                black_box(acc);
-            });
+            }
         }
-        let writers: Vec<_> = (0..WRITERS)
-            .map(|w| {
-                let book = Arc::clone(&book);
-                let samples = Arc::clone(&samples);
-                scope.spawn(move || {
-                    let handle = if use_handle {
-                        Some(domain.handle())
-                    } else {
-                        None
-                    };
-                    let mut mine = Vec::with_capacity((SYMBOLS / WRITERS as u64 * LEVELS) as usize);
-                    // Each writer owns a contiguous slice of symbols, as a feed
-                    // handler shard would.
-                    let per = SYMBOLS / WRITERS as u64;
-                    let from = w as u64 * per;
-                    let mut n = 0u64;
-                    for symbol in from..from + per {
-                        for level in 0..LEVELS {
-                            let key = symbol * LEVELS + level;
-                            let at = Instant::now();
-                            if let Some(h) = &handle {
-                                let g = h.pin();
-                                book[key as usize].store(key.wrapping_mul(31), Ordering::Relaxed);
-                                black_box(&g);
-                            } else {
-                                let g = domain.pin();
-                                book[key as usize].store(key.wrapping_mul(31), Ordering::Relaxed);
-                                black_box(&g);
-                            }
-                            n += 1;
-                            if n.is_multiple_of(64) {
-                                domain.retire(|| ());
-                            }
-                            mine.push(at.elapsed());
-                        }
-                    }
-                    samples.lock().expect("not poisoned").extend(mine);
-                })
-            })
-            .collect();
-        for writer in writers {
-            writer.join().expect("writer");
-        }
-        stop.store(true, Ordering::Relaxed);
+        // Dropping senders terminates workers before scoped joining; their
+        // registration teardown is outside every measured burst.
+        drop(writers);
+        drop(readers);
     });
-    let drained = started.elapsed();
-    let latencies = core::mem::take(&mut *samples.lock().expect("not poisoned"));
-    (drained, cpu() - before, latencies)
+    assert_eq!(domain.pending(), 0);
+    results
 }
 
-fn median(mut v: Vec<Duration>) -> Duration {
-    v.sort_unstable();
-    v[v.len() / 2]
-}
-
-fn pct(v: &[Duration], p: f64) -> Duration {
-    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
+fn percentile(sorted: &[Duration], per_mille: usize) -> Duration {
+    sorted[(sorted.len() * per_mille / 1_000).min(sorted.len() - 1)]
 }
 
 fn main() {
-    let updates = SYMBOLS * LEVELS;
-    println!(
-        "\n  {SYMBOLS} symbols x {LEVELS} levels per burst, {WRITERS} writers, {READERS} readers, {BURSTS} bursts.\n\
-         \n  thru  = updates per second while a burst is draining, in millions.\n  \
-           drain = time for a whole burst to land; the feed sends one every 500 ms.\n  \
-           p50..max = latency of one update, across every update of every burst.\n\
-         \n  The arms differ only in how a pin finds this thread's registration.\n  \
-           The third row is the first arm again, so the table carries its own\n  \
-           noise floor: whatever it differs from row one by is drift."
-    );
-
+    println!("{UPDATES} updates/burst; {WRITERS} persistent writers, {READERS} readers");
+    println!("{WARMUP_ROUNDS} warmup + {ROUNDS} measured rounds; counterbalanced TLS/handle/TLS control");
+    println!("60 retirements/burst; advance_up_to(8) after each retirement; final drain excluded");
+    println!("CPU: release through reader shutdown; drain: release through last writer timestamp");
+    println!("No affinity control; sampled update times include clocks and periodic reclamation.");
     for think in [0u32, 100, 1_000, 10_000] {
-        println!("\n  reader think time: {think}");
-        println!("                        thru   cpu ms    drain ms          update latency ms");
-        println!(
-            "  pin path              M/s   median   median   worst    p50     p99   p99.9     max"
-        );
-        for (name, use_handle) in [
-            ("thread-local", false),
-            ("handle", true),
-            ("null (thread-local)", false),
-        ] {
-            let mut drains = Vec::with_capacity(BURSTS);
-            let mut cpus = Vec::with_capacity(BURSTS);
-            let mut latencies = Vec::with_capacity(BURSTS * updates as usize);
-            for _ in 0..BURSTS {
-                let (drain, burst_cpu, mut samples) = burst(think, use_handle);
-                drains.push(drain);
-                cpus.push(burst_cpu);
-                latencies.append(&mut samples);
-            }
-            latencies.sort_unstable();
-            let drain_median = median(drains.clone());
-            let worst = drains.into_iter().max().unwrap_or_default();
-            let thru = updates as f64 / drain_median.as_secs_f64() / 1e6;
-            println!(
-                "  {name:<20} {thru:>5.2} {:>8.2} {:>8.2} {:>7.2} {:>7.3} {:>7.3} {:>7.3} {:>7.3}",
-                median(cpus).as_secs_f64() * 1e3,
-                drain_median.as_secs_f64() * 1e3,
-                worst.as_secs_f64() * 1e3,
-                pct(&latencies, 0.50).as_secs_f64() * 1e3,
-                pct(&latencies, 0.99).as_secs_f64() * 1e3,
-                pct(&latencies, 0.999).as_secs_f64() * 1e3,
-                latencies.last().copied().unwrap_or_default().as_secs_f64() * 1e3,
-            );
+        println!("\nreader think: {think} spin_loop iterations");
+        println!("arm             Mupdates/s  drain us  CPU ms  reads/burst   p50 ns   p99 ns p99.9 ns   max ns");
+        for (name, mut result) in ["TLS", "handle", "TLS control"].into_iter().zip(run(think)) {
+            result.drains.sort_unstable();
+            result.cpus.sort_unstable();
+            result.reads.sort_unstable();
+            result.latencies.sort_unstable();
+            let drain = percentile(&result.drains, 500);
+            let cpu = if result.cpus.is_empty() {
+                "n/a".to_owned()
+            } else {
+                format!("{:.3}", percentile(&result.cpus, 500).as_secs_f64() * 1e3)
+            };
+            println!("{name:<15} {:>10.3} {:>9.3} {cpu:>7} {:>12} {:>8} {:>8} {:>8} {:>8}",
+                UPDATES as f64 / drain.as_secs_f64() / 1e6,
+                drain.as_secs_f64() * 1e6,
+                result.reads[result.reads.len() / 2],
+                percentile(&result.latencies, 500).as_nanos(),
+                percentile(&result.latencies, 990).as_nanos(),
+                percentile(&result.latencies, 999).as_nanos(),
+                result.latencies.last().unwrap().as_nanos());
         }
     }
 }
