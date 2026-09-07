@@ -573,6 +573,10 @@ impl Drop for HandleGuard<'_, '_> {
 }
 
 #[cfg(test)]
+#[path = "domain/post_scan_race.rs"]
+mod post_scan_race;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use core::cell::RefCell;
