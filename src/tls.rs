@@ -46,6 +46,13 @@ unsafe extern "system" fn drop_value<T>(value: *const core::ffi::c_void) {
     }
 }
 
+// No platform TLS means no platform-run destructor, so this is never called.
+// It exists so `Tls::with` has one signature on every target: the alternative
+// is a `cfg` at the call site, which would then need one for every future
+// target that has no TLS API either.
+#[cfg(not(any(unix, windows)))]
+unsafe extern "C" fn drop_value<T>(_value: *mut core::ffi::c_void) {}
+
 mod slot {
     use core::ffi::c_void;
 
@@ -176,6 +183,57 @@ mod slot {
     pub(super) fn set(key: usize, value: *mut c_void) -> bool {
         // SAFETY: as above.
         unsafe { windows_sys::Win32::System::Threading::FlsSetValue(key as u32, value) != 0 }
+    }
+
+    // A target with neither `pthread_key_*` nor `Fls*`: bare metal.
+    //
+    // **This is not thread-local storage and does not pretend to be.** There is
+    // no platform to ask for a per-thread slot, so the values are global and a
+    // second thread would see the first one's. A target reaching this code has
+    // no threads to begin with, which is why it has no TLS API; if that changes
+    // the consumer has to supply the slots, the same way it supplies a `Host`.
+    //
+    // Without it, this crate cannot be compiled for such a target at all, and
+    // it is reached from `arctic-wt` and `WorkTablesIndex`, so it decides
+    // whether a whole storage engine can be embedded.
+    #[cfg(not(any(unix, windows)))]
+    mod bare {
+        use core::ffi::c_void;
+        use core::sync::atomic::{AtomicPtr, AtomicUsize};
+
+        /// Distinct keys. Bounded because there is nowhere to allocate a table
+        /// from before `alloc` is set up, and a handful is all this crate asks
+        /// for: one per `Tls<T>` instantiation.
+        pub(super) const SLOTS: usize = 64;
+        pub(super) static NEXT: AtomicUsize = AtomicUsize::new(0);
+        const EMPTY: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+        pub(super) static VALUES: [AtomicPtr<c_void>; SLOTS] = [EMPTY; SLOTS];
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn create(_drop: unsafe extern "C" fn(*mut c_void)) -> usize {
+        use core::sync::atomic::Ordering;
+        // The destructor is dropped on the floor: nothing here ever ends a
+        // thread, so nothing would ever run it.
+        let key = bare::NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(key < bare::SLOTS, "ps-reclaim: out of bare-metal TLS slots");
+        key
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn destroy(_key: usize) {}
+
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn get(key: usize) -> *mut c_void {
+        use core::sync::atomic::Ordering;
+        bare::VALUES[key].load(Ordering::Acquire)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    pub(super) fn set(key: usize, value: *mut c_void) -> bool {
+        use core::sync::atomic::Ordering;
+        bare::VALUES[key].store(value, Ordering::Release);
+        true
     }
 }
 
