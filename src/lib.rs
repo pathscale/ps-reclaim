@@ -59,7 +59,7 @@ mod tls;
 mod domain;
 mod registry;
 
-pub use domain::{Domain, Guard, Handle, HandleGuard};
+pub use domain::{Domain, Guard, Handle, HandleGuard, ReaderGuard, ReaderSlot};
 pub use registry::{RegistryStats, registry_stats, slots_handed_out};
 
 /// Registry capacity, including one shared overflow slot.

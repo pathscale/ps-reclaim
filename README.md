@@ -34,6 +34,19 @@ those guards drop, then recovered on a subsequent cold registration path.
 Truly forgotten guards continue to consume capacity. Use `registry_stats()` for
 cold-path capacity diagnostics, not allocation-leak reports.
 
+## Readers in signal handlers
+
+`ReaderSlot::register()` takes a registry slot once, outside signal context.
+`domain.pin_reader(&slot)` and dropping its guard are then lock-free, take no
+allocation, touch no thread-local storage and call nothing but a cold
+in-crate `fetch_add`: a relaxed load, compare-and-swaps that claim a pin
+entry, and a fence. That is async-signal-safe. The slot is `Send + Sync`, so
+one `static` slot serves every thread; concurrent and nested (handler inside
+a reader) pins each claim their own entry, and pins past the four entries
+go to the wildcard, which delays every domain until they drop.
+`tests/reader_slot.rs` proves it: zero allocations under a counting
+allocator, retirements held by nested, many-thread and in-handler pins.
+
 ## Cost
 
 Historical pin cost, M4 Max, old `cargo bench --bench pin`, ns/op. These are not
