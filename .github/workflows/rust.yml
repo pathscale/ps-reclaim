@@ -35,6 +35,11 @@ jobs:
         run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose
+      # The bare `no_std` build, with no feature named. 0.1.4 failed here: its
+      # `spin` and `libc` were optional, so `default-features = false` alone
+      # did not compile, and nothing on push tried it.
+      - name: Build without std
+        run: cargo check --lib --no-default-features
 
   lint:
     name: Format and clippy
