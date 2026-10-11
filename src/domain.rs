@@ -654,6 +654,153 @@ impl Drop for HandleGuard<'_, '_> {
     }
 }
 
+/// A registration any thread, or a signal handler on any thread, pins through.
+///
+/// [`Handle`] keeps its occupancy mask in a `Cell`, so it is `!Sync` and a
+/// signal arriving between that mask's load and store on the same thread
+/// corrupts it. [`Domain::pin`] reads thread-local storage and may register,
+/// which locks and allocates. Neither is usable from an async signal handler.
+///
+/// A reader slot claims its pin entries with a compare-and-swap on the shared
+/// participant instead, so occupancy is the slot itself. Concurrent pins from
+/// several threads, and a pin taken by a handler that interrupted a pin on the
+/// same thread, each claim a different entry. Past [`crate::MAX_NESTED_PINS`]
+/// simultaneous pins, the rest go to the wildcard counter, which composes, and
+/// delay every domain until they drop: conservative, never unsound.
+///
+/// [`Self::register`] is the cold part: it may lock and allocate, so call it
+/// outside signal context (a constructor, or before installing the handler).
+/// [`Domain::pin_reader`] and dropping its guard are then lock-free, take no
+/// allocation, touch no thread-local storage and make no call: a relaxed
+/// load, at most [`crate::MAX_NESTED_PINS`] compare-and-swaps or one
+/// `fetch_add`, and a fence. That is async-signal-safe.
+///
+/// One slot uses one registry entry, like a [`Handle`]. It is `Send` and
+/// `Sync`, so one `static` slot serves a whole process.
+///
+/// ```
+/// use ps_reclaim::{Domain, ReaderSlot};
+/// let slot = ReaderSlot::register();
+/// let domain = Domain::new();
+/// let outer = domain.pin_reader(&slot);
+/// let inner = domain.pin_reader(&slot); // As a signal handler would.
+/// drop(outer);
+/// drop(inner);
+/// ```
+pub struct ReaderSlot {
+    participant: &'static Participant,
+    /// The registry was out of exclusive slots. Every pin then uses the
+    /// wildcard, because the shared slot's entries belong to other owners.
+    shared: bool,
+    lease: Option<crate::registry::SlotLease>,
+}
+
+impl ReaderSlot {
+    /// Acquire one registry slot. May lock and initialize the registry; never
+    /// call it from a signal handler.
+    pub fn register() -> Self {
+        let registry = Registry::get();
+        let (idx, shared) = registry.acquire();
+        ReaderSlot {
+            participant: &registry.slots[idx],
+            shared,
+            lease: Some(crate::registry::SlotLease(idx, shared)),
+        }
+    }
+
+    /// Whether this slot is the shared overflow slot, so that every pin through
+    /// it is a wildcard pin and delays reclamation in every domain.
+    pub fn is_shared(&self) -> bool {
+        self.shared
+    }
+}
+
+impl Drop for ReaderSlot {
+    fn drop(&mut self) {
+        drop(self.lease.take());
+    }
+}
+
+impl Domain {
+    /// Pin through a [`ReaderSlot`]: lock-free, allocation-free and
+    /// async-signal-safe, from any thread.
+    ///
+    /// The guard must cover every protected pointer load and dereference, as
+    /// with [`Self::pin`].
+    ///
+    /// ```compile_fail
+    /// use ps_reclaim::{Domain, ReaderSlot};
+    /// let domain = Domain::new();
+    /// let slot = ReaderSlot::register();
+    /// let guard = domain.pin_reader(&slot);
+    /// drop(slot);
+    /// drop(guard);
+    /// ```
+    #[inline]
+    pub fn pin_reader<'s, 'd>(&'d self, slot: &'s ReaderSlot) -> ReaderGuard<'s, 'd> {
+        let p = slot.participant;
+        let e = self.epoch.load(Ordering::Relaxed);
+        let packed = (e << DOMAIN_BITS) | (self.id & DOMAIN_MASK);
+        let mut entry = usize::MAX;
+        if !slot.shared {
+            // The claim is the occupancy record. A plain store, as `pin` uses,
+            // would let two readers of this slot share one entry, and the first
+            // to drop would publish the slot idle under the second.
+            for (i, pin) in p.pins.iter().enumerate() {
+                if pin
+                    .compare_exchange(NO_DOMAIN, packed, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    entry = i;
+                    break;
+                }
+            }
+        }
+        if entry == usize::MAX {
+            pin_wildcard(p);
+        }
+        // Paired with the fence in `advance`, exactly as in `pin`.
+        fence(Ordering::SeqCst);
+        ReaderGuard {
+            participant: p,
+            entry,
+            borrows: PhantomData,
+        }
+    }
+}
+
+/// A pin taken through a [`ReaderSlot`]. Dropping it is one atomic store (or
+/// one `fetch_sub` for a wildcard pin), so it is async-signal-safe too.
+///
+/// `!Send`, like the other guards: a pin belongs to the reader that took it.
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<ps_reclaim::ReaderGuard<'static, 'static>>();
+/// ```
+#[must_use = "a dropped guard no longer protects reader accesses"]
+pub struct ReaderGuard<'s, 'd> {
+    participant: &'static Participant,
+    entry: usize,
+    borrows: PhantomData<(&'s ReaderSlot, &'d Domain, *const ())>,
+}
+
+impl Drop for ReaderGuard<'_, '_> {
+    #[inline]
+    fn drop(&mut self) {
+        // `get`, not indexing: the wildcard is entry usize::MAX, and no panic
+        // path may be reachable from a signal handler, even a dead one.
+        match self.participant.pins.get(self.entry) {
+            // Release, so a reclaimer that sees the entry free also sees every
+            // access made under it. Only this guard claimed the entry.
+            Some(pin) => pin.store(NO_DOMAIN, Ordering::Release),
+            None => {
+                self.participant.wildcard.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "domain/post_scan_race.rs"]
 mod post_scan_race;
