@@ -180,7 +180,8 @@ fn many_threads_on_one_slot_each_hold() {
     }
 }
 
-#[cfg(unix)]
+// Not under Miri: it cannot call the foreign `signal` and `raise`.
+#[cfg(all(unix, not(miri)))]
 mod signal {
     use super::*;
 
