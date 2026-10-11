@@ -44,6 +44,22 @@ fn drive(domain: &Domain) {
     }
 }
 
+/// Advances until `ran` is set, for up to ten seconds. A fixed number of
+/// advances is not enough: wildcard pins are process-wide and delay
+/// reclamation in every domain, and the other tests in this binary take
+/// them (more than four pins on one slot) while they run in parallel.
+fn drive_until(domain: &Domain, ran: &AtomicBool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !ran.load(Ordering::SeqCst) {
+        if std::time::Instant::now() > deadline {
+            return false;
+        }
+        domain.advance();
+        std::thread::yield_now();
+    }
+    true
+}
+
 #[test]
 fn pin_and_unpin_through_a_slot_allocate_nothing() {
     let slot = ReaderSlot::register();
@@ -79,9 +95,8 @@ fn a_slot_pin_holds_an_older_retirement() {
         "ran while a slot reader was pinned"
     );
     drop(guard);
-    drive(&domain);
     assert!(
-        ran.load(Ordering::SeqCst),
+        drive_until(&domain, &ran),
         "never ran after the slot reader left"
     );
 }
@@ -109,8 +124,7 @@ fn nested_pins_on_one_slot_each_hold() {
             "dropping one pin released the other (inner_first={inner_first})"
         );
         drop(second);
-        drive(&domain);
-        assert!(ran.load(Ordering::SeqCst));
+        assert!(drive_until(&domain, &ran));
     }
 }
 
@@ -162,8 +176,7 @@ fn many_threads_on_one_slot_each_hold() {
         for t in threads {
             t.join().unwrap();
         }
-        drive(&domain);
-        assert!(ran.load(Ordering::SeqCst));
+        assert!(drive_until(&domain, &ran));
     }
 }
 
@@ -205,7 +218,6 @@ mod signal {
             "the handler's unpin released the interrupted pin"
         );
         drop(outer);
-        drive(domain);
-        assert!(ran.load(Ordering::SeqCst));
+        assert!(drive_until(domain, &ran));
     }
 }
