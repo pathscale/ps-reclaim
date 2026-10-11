@@ -73,6 +73,7 @@ jobs:
         run: |
           set -e
           for args in \
+            "--no-default-features" \
             "--no-default-features --features libc,spin" \
             "--no-default-features --features libc,spin,spin-garbage" \
             "--features spin-garbage" \

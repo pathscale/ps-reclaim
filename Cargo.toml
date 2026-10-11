@@ -11,30 +11,37 @@ repository = "https://github.com/pathscale/ps-reclaim"
 # `spin` rather than a hand-rolled lock: a spin mutex and a once-cell are the
 # kind of small unsafe primitive that looks obvious and is not, and this crate
 # exists to make reclamation safe. Default features off, so it brings nothing.
+#
+# Not optional. Cargo features are additive and cannot say "when `std` is
+# off", so an optional dependency meant `default-features = false` failed to
+# compile unless the caller also named `spin` and `libc`. Every build now
+# compiles these small crates; only the `no_std` build uses them.
 spin = { version = "0.9", default-features = false, features = [
     "mutex",
     "spin_mutex",
     "once",
-], optional = true }
+] }
 
 [target.'cfg(unix)'.dependencies]
-# Only the `no_std` build needs it, for the `pthread_key_t` that stands in for
-# `thread_local!`. The default build has no dependencies at all, as before.
-libc = { version = "0.2", default-features = false, optional = true }
+# The `no_std` build uses it for the `pthread_key_t` that stands in for
+# `thread_local!`. Default features off: no `std` from here either.
+libc = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+# The `no_std` build uses it for the FLS slot that stands in for
+# `thread_local!`.
 windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
-], optional = true }
+] }
 
 [features]
 default = ["std"]
 
 # Off, this crate does not link `std`. It still needs the platform underneath:
 # `thread_local!` becomes a `pthread_key_t` on unix and an `FlsAlloc` slot on
-# Windows, so turning `std` off means turning the platform crate on:
+# Windows. Those crates are always dependencies, so nothing else is needed:
 #
-#     ps-reclaim = { version = "0.1", default-features = false, features = ["libc", "spin"] }
+#     ps-reclaim = { version = "0.1", default-features = false }
 #
 # `Mutex` and `OnceLock` become spins over `core` atomics. Neither is on the
 # steady-state read path; writer tail latency still needs measurement.
@@ -54,7 +61,13 @@ inline-tsd = []
 
 # Experimental isolation control: with std, change only the garbage-list
 # mutex, leaving TLS and the registry allocator unchanged. Not a speed claim.
-spin-garbage = ["spin"]
+spin-garbage = []
+
+# Accepted and ignored. 0.1.4 needed them for a `no_std` build, so manifests
+# that name them keep resolving; the dependencies are no longer optional.
+libc = []
+spin = []
+windows-sys = []
 
 [dev-dependencies]
 # Only to measure against what this replaces. Not a runtime dependency.
