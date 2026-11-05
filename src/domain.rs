@@ -188,6 +188,9 @@ impl Domain {
     where
         F: FnOnce() + Send + 'static,
     {
+        // Order the caller's unlink before the retirement epoch is sampled.
+        // Pair with the SeqCst fence after readers publish their pins.
+        fence(Ordering::SeqCst);
         let e = self.epoch.load(Ordering::Relaxed);
         let run: Deferred = Box::new(f);
         let mut garbage = crate::sync::garbage_lock(&self.garbage);
