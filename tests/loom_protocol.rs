@@ -75,6 +75,7 @@ impl Domain {
 
     fn unlink(&self) {
         self.root.store(0, Ordering::Release);
+        fence(Ordering::SeqCst);
         let now = self.epoch.load(Ordering::Relaxed);
         let mut garbage = self.garbage.lock().unwrap();
         let sequence = garbage.next;
