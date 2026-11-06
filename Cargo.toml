@@ -3,6 +3,7 @@ name = "ps-reclaim"
 version = "0.1.5"
 edition = "2024"
 license = "MIT"
+publish = ["crates-io"]
 description = "Per-domain grace-period reclamation for lock-free readers"
 repository = "https://github.com/pathscale/ps-reclaim"
 
