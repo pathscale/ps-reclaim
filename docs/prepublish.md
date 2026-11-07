@@ -1,9 +1,11 @@
 # Local checks before publishing
 
-Publishing is a manual action from `master`. Before dispatching it, review the
-exact commit, run `cargo publish --dry-run`, and attest that the applicable
-checks below passed. The manual Actions workflow remains available for the
-feature, platform, Miri, and Loom jobs.
+Publishing is a manual action from `master`. Review the change and run the
+applicable checks below, including `cargo publish --dry-run`, before dispatching
+the `Publish crate` workflow. It runs `cargo publish --registry crates-io`
+directly. Cargo.toml's `[package].version` is the release version, and its
+`publish` allowlist must include `crates-io`. The separate manual Actions
+workflow remains available for the feature, platform, Miri, and Loom jobs.
 
 ```sh
 cargo fmt --all -- --check
