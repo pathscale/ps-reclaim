@@ -16,6 +16,9 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 15
     steps:
+      - name: Check publication ref
+        shell: sh
+        run: test "$GITHUB_REF" = refs/heads/master
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
