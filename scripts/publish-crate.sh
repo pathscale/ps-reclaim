@@ -17,7 +17,9 @@ esac
 [ "${#expected_commit}" -eq 40 ] || fail 'EXPECTED_COMMIT must be a full 40-character commit SHA'
 actual_commit=$(git rev-parse HEAD)
 [ "$actual_commit" = "$expected_commit" ] || fail 'checked out commit does not match EXPECTED_COMMIT'
-[ -z "$(git status --porcelain --untracked-files=all)" ] || fail 'working tree must be clean'
+tree_status=$(git status --porcelain --untracked-files=all) \
+  || fail 'could not verify working tree status'
+[ -z "$tree_status" ] || fail 'working tree must be clean'
 
 manifest=$(cargo read-manifest --manifest-path Cargo.toml)
 package_name=$(jq -er '.name | select(type == "string" and length > 0)' <<<"$manifest")
@@ -33,7 +35,7 @@ esac
 
 crate_id=$(jq -nr --arg name "$package_name" '$name | ascii_downcase | @uri')
 version_id=$(jq -nr --arg version "$version" '$version | @uri')
-status=$(curl --silent --show-error --location --max-redirs 3 \
+status=$(curl --disable --proto '=https' --silent --show-error \
   --user-agent 'manifest-cargo-publisher (https://github.com/pathscale/ps-reclaim)' \
   --connect-timeout 10 --max-time 30 --retry 0 \
   --output /dev/null --write-out '%{http_code}' \
@@ -53,5 +55,7 @@ case "$status" in
     ;;
 esac
 
-[ -z "$(git status --porcelain --untracked-files=all)" ] || fail 'working tree must be clean'
+tree_status=$(git status --porcelain --untracked-files=all) \
+  || fail 'could not verify working tree status'
+[ -z "$tree_status" ] || fail 'working tree must be clean'
 cargo publish --registry crates-io --package "$package_name"
