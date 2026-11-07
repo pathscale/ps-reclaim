@@ -6,6 +6,8 @@ checks below passed. The manual Actions workflow remains available for the
 feature, platform, Miri, and Loom jobs.
 
 ```sh
+cargo fmt --all -- --check
+cargo clippy --lib --bins --tests -- -D warnings
 cargo test --verbose
 cargo check --lib --no-default-features
 cargo test --no-default-features
