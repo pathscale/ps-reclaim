@@ -15,18 +15,13 @@ repository = "https://github.com/pathscale/ps-reclaim"
 #
 # Not optional. Cargo features are additive and cannot say "when `std` is
 # off", so an optional dependency meant `default-features = false` failed to
-# compile unless the caller also named `spin` and `libc`. Every build now
-# compiles these small crates; only the `no_std` build uses them.
+# compile unless the caller also named `spin`. Every build now compiles this
+# small crate; only the `no_std` build uses it.
 spin = { version = "0.9", default-features = false, features = [
     "mutex",
     "spin_mutex",
     "once",
 ] }
-
-[target.'cfg(unix)'.dependencies]
-# The `no_std` build uses it for the `pthread_key_t` that stands in for
-# `thread_local!`. Default features off: no `std` from here either.
-libc = { version = "0.2", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 # The `no_std` build uses it for the FLS slot that stands in for
