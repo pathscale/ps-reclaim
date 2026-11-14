@@ -49,12 +49,31 @@ unsafe extern "system" fn drop_value<T>(value: *const core::ffi::c_void) {
 mod slot {
     use core::ffi::c_void;
 
+    #[cfg(all(unix, target_vendor = "apple"))]
+    #[allow(non_camel_case_types)]
+    type pthread_key_t = core::ffi::c_ulong;
+
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[allow(non_camel_case_types)]
+    type pthread_key_t = core::ffi::c_uint;
+
+    #[cfg(unix)]
+    unsafe extern "C" {
+        fn pthread_key_create(
+            key: *mut pthread_key_t,
+            dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+        ) -> core::ffi::c_int;
+        fn pthread_key_delete(key: pthread_key_t) -> core::ffi::c_int;
+        fn pthread_getspecific(key: pthread_key_t) -> *mut c_void;
+        fn pthread_setspecific(key: pthread_key_t, value: *const c_void) -> core::ffi::c_int;
+    }
+
     #[cfg(unix)]
     pub(super) fn create(drop: unsafe extern "C" fn(*mut c_void)) -> usize {
-        let mut fresh: libc::pthread_key_t = 0;
+        let mut fresh: pthread_key_t = 0;
         // SAFETY: `fresh` is a live local and `drop` is valid for the life of
         // the process.
-        let rc = unsafe { libc::pthread_key_create(&raw mut fresh, Some(drop)) };
+        let rc = unsafe { pthread_key_create(&raw mut fresh, Some(drop)) };
         assert_eq!(rc, 0, "pthread_key_create");
         let key = fresh as usize;
 
@@ -73,13 +92,13 @@ mod slot {
             let sentinel = &raw const fresh as *mut c_void;
             // SAFETY: `key` was just created and holds no value on this thread,
             // so the sentinel cannot displace anything, and it is cleared below.
-            let stored = unsafe { libc::pthread_setspecific(fresh, sentinel) == 0 };
+            let stored = unsafe { pthread_setspecific(fresh, sentinel) == 0 };
             assert!(stored, "pthread_setspecific while checking the TSD layout");
             let inlined = get(key);
             // SAFETY: as above.
-            let via_libc = unsafe { libc::pthread_getspecific(fresh) };
+            let via_libc = unsafe { pthread_getspecific(fresh) };
             // SAFETY: as above; puts the slot back the way it was found.
-            unsafe { libc::pthread_setspecific(fresh, core::ptr::null_mut()) };
+            unsafe { pthread_setspecific(fresh, core::ptr::null_mut()) };
             assert_eq!(
                 inlined, via_libc,
                 "the inline TSD read disagrees with pthread_getspecific: the \
@@ -94,7 +113,7 @@ mod slot {
     #[cfg(unix)]
     pub(super) fn destroy(key: usize) {
         // SAFETY: `key` came from `create` and no thread has stored under it.
-        unsafe { libc::pthread_key_delete(key as libc::pthread_key_t) };
+        unsafe { pthread_key_delete(key as pthread_key_t) };
     }
 
     /// Read this thread's slot.
@@ -143,13 +162,13 @@ mod slot {
     ))]
     pub(super) fn get(key: usize) -> *mut c_void {
         // SAFETY: `key` came from `create` and is valid process-wide.
-        unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }
+        unsafe { pthread_getspecific(key as pthread_key_t) }
     }
 
     #[cfg(unix)]
     pub(super) fn set(key: usize, value: *mut c_void) -> bool {
         // SAFETY: as above; `value` is live and uniquely owned.
-        unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, value) == 0 }
+        unsafe { pthread_setspecific(key as pthread_key_t, value) == 0 }
     }
 
     #[cfg(windows)]
