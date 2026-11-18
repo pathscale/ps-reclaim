@@ -37,6 +37,15 @@ unsafe extern "C" fn drop_value<T>(value: *mut core::ffi::c_void) {
     }
 }
 
+#[cfg(target_os = "none")]
+unsafe extern "C" fn drop_value<T>(value: *mut u8) {
+    if !value.is_null() {
+        // SAFETY: the only pointer ever stored under this key came from
+        // `Box::into_raw` in `with`, for this same `T`.
+        drop(unsafe { Box::from_raw(value.cast::<T>()) });
+    }
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn drop_value<T>(value: *const core::ffi::c_void) {
     if !value.is_null() {
@@ -195,6 +204,26 @@ mod slot {
     pub(super) fn set(key: usize, value: *mut c_void) -> bool {
         // SAFETY: as above.
         unsafe { windows_sys::Win32::System::Threading::FlsSetValue(key as u32, value) != 0 }
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn create(drop: unsafe extern "C" fn(*mut u8)) -> usize {
+        libc_rs::thread::tls_key_create(Some(drop)).expect("tls_key_create")
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn destroy(key: usize) {
+        libc_rs::thread::tls_key_delete(key);
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn get(key: usize) -> *mut c_void {
+        libc_rs::thread::tls_get(key).cast()
+    }
+
+    #[cfg(target_os = "none")]
+    pub(super) fn set(key: usize, value: *mut c_void) -> bool {
+        libc_rs::thread::tls_set(key, value.cast())
     }
 }
 

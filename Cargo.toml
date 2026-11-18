@@ -1,6 +1,6 @@
 [package]
 name = "ps-reclaim"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "MIT"
 publish = ["crates-io"]
@@ -29,6 +29,9 @@ spin = { version = "0.9", default-features = false, features = [
 windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "none")'.dependencies]
+libc-rs = "0.2.5"
 
 [features]
 default = ["std"]
