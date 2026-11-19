@@ -58,24 +58,11 @@ unsafe extern "system" fn drop_value<T>(value: *const core::ffi::c_void) {
 mod slot {
     use core::ffi::c_void;
 
-    #[cfg(all(unix, target_vendor = "apple"))]
-    #[allow(non_camel_case_types)]
-    type pthread_key_t = core::ffi::c_ulong;
-
-    #[cfg(all(unix, not(target_vendor = "apple")))]
-    #[allow(non_camel_case_types)]
-    type pthread_key_t = core::ffi::c_uint;
-
     #[cfg(unix)]
-    unsafe extern "C" {
-        fn pthread_key_create(
-            key: *mut pthread_key_t,
-            dtor: Option<unsafe extern "C" fn(*mut c_void)>,
-        ) -> core::ffi::c_int;
-        fn pthread_key_delete(key: pthread_key_t) -> core::ffi::c_int;
-        fn pthread_getspecific(key: pthread_key_t) -> *mut c_void;
-        fn pthread_setspecific(key: pthread_key_t, value: *const c_void) -> core::ffi::c_int;
-    }
+    use eko::libc_lite::{
+        pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_key_t,
+        pthread_setspecific,
+    };
 
     #[cfg(unix)]
     pub(super) fn create(drop: unsafe extern "C" fn(*mut c_void)) -> usize {

@@ -1,6 +1,6 @@
 [package]
 name = "ps-reclaim"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 license = "MIT"
 publish = ["crates-io"]
@@ -8,24 +8,10 @@ description = "Per-domain grace-period reclamation for lock-free readers"
 repository = "https://github.com/pathscale/ps-reclaim"
 
 [dependencies]
-
-# `spin` rather than a hand-rolled lock: a spin mutex and a once-cell are the
-# kind of small unsafe primitive that looks obvious and is not, and this crate
-# exists to make reclamation safe. Default features off, so it brings nothing.
-#
-# Not optional. Cargo features are additive and cannot say "when `std` is
-# off", so an optional dependency meant `default-features = false` failed to
-# compile unless the caller also named `spin`. Every build now compiles this
-# small crate; only the `no_std` build uses it.
-spin = { version = "0.9", default-features = false, features = [
-    "mutex",
-    "spin_mutex",
-    "once",
-] }
+ekostd = { version = "^0.2.11", default-features = false }
+parking_lot = { package = "parking_lot_lite_hack", version = "^0.12.10", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-# The `no_std` build uses it for the FLS slot that stands in for
-# `thread_local!`.
 windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
 ] }
@@ -34,16 +20,10 @@ windows-sys = { version = "0.60", features = [
 libc-rs = "0.2.5"
 
 [features]
-default = ["std"]
+default = []
 
-# Off, this crate does not link `std`. It still needs the platform underneath:
-# `thread_local!` becomes a `pthread_key_t` on unix and an `FlsAlloc` slot on
-# Windows. Those crates are always dependencies, so nothing else is needed:
-#
-#     ps-reclaim = { version = "0.1", default-features = false }
-#
-# `Mutex` and `OnceLock` become spins over `core` atomics. Neither is on the
-# steady-state read path; writer tail latency still needs measurement.
+# Retained as a no-op alias so downstream manifests naming `ps-reclaim/std` keep resolving;
+# the crate always uses its unified no_std + ekostd codepath.
 std = []
 
 # Native Unix TLS for the cache; its separately owned lease closes the cache
@@ -58,12 +38,8 @@ nightly = []
 # other target keeps the call.
 inline-tsd = []
 
-# Experimental isolation control: with std, change only the garbage-list
-# mutex, leaving TLS and the registry allocator unchanged. Not a speed claim.
+# Accepted and ignored compatibility aliases.
 spin-garbage = []
-
-# Accepted and ignored. 0.1.4 needed them for a `no_std` build, so manifests
-# that name them keep resolving; the dependencies are no longer optional.
 libc = []
 spin = []
 windows-sys = []
@@ -76,12 +52,6 @@ criterion = "0.5"
 # `getrusage` in `benches/burst.rs`: wall clock cannot see a burnt core.
 libc = "0.2"
 
-# Built only when `--cfg ps_loom` is set; Cargo may still resolve its metadata.
-#
-#     RUSTFLAGS="--cfg ps_loom" cargo test --test loom_model --test loom_protocol
-#
-# Manual, like Miri: exhaustive interleaving exploration is not something to put
-# on every push.
 [target.'cfg(ps_loom)'.dev-dependencies]
 loom = "0.7"
 

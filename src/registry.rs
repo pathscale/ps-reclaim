@@ -188,46 +188,40 @@ impl Local {
 // Native Local has no destructor. Close its cache before returning the lease.
 // The hot cache remains available during later TLS destructors, but attempting
 // to register through it again is rejected on the cold path.
-#[cfg(any(feature = "std", all(feature = "nightly", unix)))]
+#[cfg(all(feature = "nightly", unix))]
 struct ThreadLease {
     _lease: SlotLease,
 }
 
-#[cfg(any(feature = "std", all(feature = "nightly", unix)))]
+#[cfg(all(feature = "nightly", unix))]
 impl Drop for ThreadLease {
     fn drop(&mut self) {
         let _ = try_with_local(Local::close);
     }
 }
 
-#[cfg(feature = "std")]
-thread_local! {
-    static LOCAL: Local = const { Local::new() };
-    static LEASE: RefCell<Option<ThreadLease>> = const { RefCell::new(None) };
-}
-
-// Without `std`, `LEASE` is a platform key because it has a destructor that
+// `LEASE` is a platform key because it has a destructor that
 // has to run at thread exit. That is the one thing `#[thread_local]` cannot do
 // and the one thing a platform key is genuinely needed for here.
-#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+#[cfg(all(feature = "nightly", unix))]
 static LEASE: crate::tls::Tls<RefCell<Option<ThreadLease>>> = crate::tls::Tls::new();
 
 // `Local` is the hot one and it has no destructor, so on nightly it can be the
 // native TLS cache. Generated access costs depend on the target and linkage;
 // the platform-key lease is only accessed on registration and teardown.
-#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+#[cfg(all(feature = "nightly", unix))]
 #[thread_local]
 static LOCAL: Local = Local::new();
 
 // On Windows, FLS lifetime is a fiber's lifetime, not a thread's. Keep both
 // cache and owner in the same FLS object, including when nightly is enabled.
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 struct OwnedLocal {
     local: Local,
     lease: RefCell<Option<SlotLease>>,
 }
 
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 impl OwnedLocal {
     fn new() -> Self {
         Self {
@@ -237,7 +231,7 @@ impl OwnedLocal {
     }
 }
 
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 impl Drop for OwnedLocal {
     fn drop(&mut self) {
         self.local.close();
@@ -245,28 +239,17 @@ impl Drop for OwnedLocal {
     }
 }
 
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 static LOCAL: crate::tls::Tls<OwnedLocal> = crate::tls::Tls::new();
 
-/// Run `f` against this thread's `Local`, which is one lookup.
-///
-/// Callers on the hot path take this **once** and read every field they need
-/// inside the closure. Calling it three times to read three fields puts back
-/// exactly the cost this exists to remove.
-#[cfg(feature = "std")]
-#[inline]
-pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
-    LOCAL.with(f)
-}
-
 /// Native TLS cache access; the generated addressing sequence is target-specific.
-#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+#[cfg(all(feature = "nightly", unix))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     f(&LOCAL)
 }
 
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 #[inline]
 pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
     LOCAL
@@ -278,15 +261,7 @@ pub(crate) fn with_local<R>(f: impl FnOnce(&Local) -> R) -> R {
 ///
 /// Publish the cached participant only if installation succeeds. A rejected
 /// installation drops the lease and returns the unused slot, not a stale cache.
-#[cfg(feature = "std")]
-#[inline]
-fn install_lease(lease: SlotLease) -> bool {
-    LEASE
-        .try_with(|l| *l.borrow_mut() = Some(ThreadLease { _lease: lease }))
-        .is_ok()
-}
-
-#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+#[cfg(all(feature = "nightly", unix))]
 #[inline]
 fn install_lease(lease: SlotLease) -> bool {
     LEASE
@@ -297,7 +272,7 @@ fn install_lease(lease: SlotLease) -> bool {
         .is_some()
 }
 
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 fn install_lease(lease: SlotLease) -> bool {
     LOCAL
         .get(|owned| *owned.lease.borrow_mut() = Some(lease))
@@ -306,19 +281,13 @@ fn install_lease(lease: SlotLease) -> bool {
 
 /// Access only an existing Local. Guard destruction must not initialize a new
 /// registration during TLS teardown.
-#[cfg(feature = "std")]
-#[inline]
-pub(crate) fn try_with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
-    LOCAL.try_with(f).ok()
-}
-
-#[cfg(all(not(feature = "std"), feature = "nightly", unix))]
+#[cfg(all(feature = "nightly", unix))]
 #[inline]
 pub(crate) fn try_with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
     Some(f(&LOCAL))
 }
 
-#[cfg(all(not(feature = "std"), not(all(feature = "nightly", unix))))]
+#[cfg(not(all(feature = "nightly", unix)))]
 #[inline]
 pub(crate) fn try_with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
     LOCAL.get(|owned| f(&owned.local))

@@ -43,17 +43,13 @@
 // library does not link `std`, since a test binary cannot.
 // Native no_std TLS is Unix-only: a platform-key lease closes its cache at
 // teardown. Windows keeps cache and lease together in FLS (fiber lifetime).
-#![cfg_attr(
-    all(not(feature = "std"), feature = "nightly", unix),
-    feature(thread_local)
-)]
-#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![cfg_attr(all(feature = "nightly", unix), feature(thread_local))]
+#![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
 
 extern crate alloc;
 
 mod sync;
-#[cfg(not(feature = "std"))]
 mod tls;
 
 mod domain;
